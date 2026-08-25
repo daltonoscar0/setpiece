@@ -1,0 +1,150 @@
+{
+ "corner_id": "36ececb0-cf39-455f-ba6b-5fcfff88ae71",
+ "players": [
+  {
+   "x": 80.30390798520756,
+   "y": 21.6732209245273,
+   "is_attacker": false,
+   "is_taker": false,
+   "is_keeper": false
+  },
+  {
+   "x": 84.16368827482805,
+   "y": 25.770221506730564,
+   "is_attacker": true,
+   "is_taker": false,
+   "is_keeper": false
+  },
+  {
+   "x": 88.67086263162224,
+   "y": 27.63588033330161,
+   "is_attacker": false,
+   "is_taker": false,
+   "is_keeper": false
+  },
+  {
+   "x": 88.9577149616166,
+   "y": 41.6828621372906,
+   "is_attacker": false,
+   "is_taker": false,
+   "is_keeper": false
+  },
+  {
+   "x": 93.82025918125079,
+   "y": 35.68518696804012,
+   "is_attacker": true,
+   "is_taker": false,
+   "is_keeper": false
+  },
+  {
+   "x": 95.56887416064052,
+   "y": 34.43795185731452,
+   "is_attacker": false,
+   "is_taker": false,
+   "is_keeper": false
+  },
+  {
+   "x": 95.86829201333573,
+   "y": 36.423729842498076,
+   "is_attacker": true,
+   "is_taker": false,
+   "is_keeper": false
+  },
+  {
+   "x": 96.30161437256416,
+   "y": 35.08408456680039,
+   "is_attacker": false,
+   "is_taker": false,
+   "is_keeper": false
+  },
+  {
+   "x": 98.20149660971495,
+   "y": 32.238111088029235,
+   "is_attacker": true,
+   "is_taker": false,
+   "is_keeper": false
+  },
+  {
+   "x": 98.80620457971976,
+   "y": 31.752578794996793,
+   "is_attacker": false,
+   "is_taker": false,
+   "is_keeper": false
+  },
+  {
+   "x": 99.48216333508384,
+   "y": 33.21764986173544,
+   "is_attacker": false,
+   "is_taker": false,
+   "is_keeper": false
+  },
+  {
+   "x": 100.28459565142546,
+   "y": 30.543770857637902,
+   "is_attacker": true,
+   "is_taker": false,
+   "is_keeper": false
+  },
+  {
+   "x": 101.39121768199496,
+   "y": 29.970255125696724,
+   "is_attacker": false,
+   "is_taker": false,
+   "is_keeper": false
+  },
+  {
+   "x": 101.42115195852433,
+   "y": 33.67340539438968,
+   "is_attacker": true,
+   "is_taker": false,
+   "is_keeper": false
+  },
+  {
+   "x": 101.44352582851053,
+   "y": 31.816225560887055,
+   "is_attacker": false,
+   "is_taker": false,
+   "is_keeper": false
+  },
+  {
+   "x": 103.01110216495564,
+   "y": 32.77530821924332,
+   "is_attacker": false,
+   "is_taker": false,
+   "is_keeper": true
+  },
+  {
+   "x": 103.32544330826347,
+   "y": 32.128774765104446,
+   "is_attacker": false,
+   "is_taker": false,
+   "is_keeper": false
+  },
+  {
+   "x": 105.0,
+   "y": 0.08500000126659871,
+   "is_attacker": true,
+   "is_taker": true,
+   "is_keeper": false
+  }
+ ],
+ "match_id": 3930163,
+ "competition": "UEFA Euro",
+ "season": "2024",
+ "period": 2,
+ "minute": 82,
+ "first_touch": "defender",
+ "receiver_idx": null,
+ "receiver_match_dist": null,
+ "shot_within_5": true,
+ "meta": {
+  "play_pattern": "From Corner",
+  "pass_length": 40.36087,
+  "pass_height": "High Pass",
+  "pass_outcome": "Incomplete",
+  "end_xy": [
+   98.175,
+   33.745000000000005
+  ]
+ }
+}

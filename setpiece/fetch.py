@@ -42,6 +42,8 @@ def build_dataset(
     state = json.loads(state_path.read_text()) if state_path.exists() else {}
     done: set[int] = set(state.get("done_matches", []))
     failures: list[dict] = state.get("failures", [])
+    #: seasons flagged as having 360 data whose freeze-frame files are absent upstream
+    no_360: dict[str, int] = state.get("no_360", {})
 
     seasons = list_360_seasons(raw_dir)
     if only_competitions:
@@ -71,6 +73,7 @@ def build_dataset(
     log.info("building dataset: %d matches to fetch", len(targets))
     with out_path.open(mode) as fh:
         for i, (match_id, season) in enumerate(targets, 1):
+            report: dict = {}
             try:
                 corners = fetch_match_corners(
                     match_id,
@@ -78,11 +81,15 @@ def build_dataset(
                     competition=season["competition"],
                     season=season["season"],
                     keep_raw=keep_raw,
+                    report=report,
                 )
             except Exception as exc:
                 failures.append({"match_id": match_id, "error": str(exc)})
                 log.warning("match %s failed: %s", match_id, exc)
                 continue
+            if not report.get("has_360", True):
+                key = f"{season['competition']} {season['season']}"
+                no_360[key] = no_360.get(key, 0) + 1
             for c in corners:
                 fh.write(json.dumps(corner_to_dict(c)) + "\n")
             fh.flush()
@@ -96,12 +103,28 @@ def build_dataset(
                             "done_matches": sorted(done),
                             "n_corners": n_corners,
                             "failures": failures,
+                            "no_360": no_360,
                         }
                     )
                 )
                 log.info("%d/%d matches, %d corners", i, len(targets), n_corners)
 
     state_path.write_text(
-        json.dumps({"done_matches": sorted(done), "n_corners": n_corners, "failures": failures})
+        json.dumps(
+            {
+                "done_matches": sorted(done),
+                "n_corners": n_corners,
+                "failures": failures,
+                "no_360": no_360,
+            }
+        )
     )
-    return {"matches": len(done), "corners": n_corners, "failures": failures}
+    if no_360:
+        for season, n in sorted(no_360.items()):
+            log.warning("%s: %d matches flagged for 360 but no freeze-frame file upstream", season, n)
+    return {
+        "matches": len(done),
+        "corners": n_corners,
+        "failures": failures,
+        "no_360": no_360,
+    }

@@ -299,8 +299,15 @@ def fetch_match_corners(
     competition: str | None = None,
     season: str | None = None,
     keep_raw: bool = False,
+    report: dict | None = None,
 ) -> list[CornerFrame]:
-    """Download one match, extract its corners, then drop the bulky raw files."""
+    """Download one match, extract its corners, then drop the bulky raw files.
+
+    Some competitions are flagged ``match_available_360`` in the catalogue yet ship
+    no freeze-frame files at all (African Cup of Nations 2023 is one). Rather than
+    silently yielding nothing, that is recorded in ``report["has_360"]`` so the
+    caller can surface it.
+    """
     ev_cache = raw_dir / "events" / f"{match_id}.json"
     ts_cache = raw_dir / "three-sixty" / f"{match_id}.json"
     events = cached_json(f"{SB_BASE}/events/{match_id}.json", ev_cache, keep=keep_raw)
@@ -311,6 +318,8 @@ def fetch_match_corners(
     except FileNotFoundError:
         log.info("no 360 file for match %s", match_id)
         three_sixty = []
+    if report is not None:
+        report["has_360"] = bool(three_sixty)
     return corners_from_match(
         events, three_sixty, match_id=match_id, competition=competition, season=season
     )
