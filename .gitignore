@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+.DS_Store
+
+# cached downloads and derived datasets
+data/raw/
+data/interim/
+data/processed/
+
+# training outputs (bundled demo models live in setpiece/assets/)
+runs/
+*.ckpt
