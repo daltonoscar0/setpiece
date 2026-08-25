@@ -42,6 +42,7 @@ import logging
 import math
 import sys
 from collections.abc import Sequence
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -55,13 +56,14 @@ __all__ = [
     "EXIT_NO_MODEL",
     "EXIT_OK",
     "EXIT_USAGE",
-    "ModelUnavailable",
+    "ModelUnavailableError",
     "build_parser",
     "demo_frames",
     "format_scores",
     "format_suggestions",
     "load_head",
     "main",
+    "run_train",
     "score_frame",
     "suggest_frame",
 ]
@@ -81,13 +83,13 @@ DEMO_DIR: Path = Path(__file__).resolve().parent / "assets" / "demo"
 #: searched and printed well inside the ten second promise.
 DEMO_MOVERS: int = 2
 DEMO_BEAM: int = 4
-DEMO_MAX_EVALS: int = 96
+DEMO_MAX_EVALS: int = 64
 DEMO_TOP_K: int = 3
 
 _FORMATS = ("pretty", "json", "csv")
 
 
-class ModelUnavailable(RuntimeError):
+class ModelUnavailableError(RuntimeError):
     """Raised when a checkpoint a command needs cannot be found or loaded."""
 
 
@@ -116,7 +118,7 @@ def load_head(kind: str, model_arg: str | Path | None = None) -> tuple[Any, dict
     receiver model is bundled.
 
     Raises:
-        ModelUnavailable: if nothing suitable exists, carrying a message that
+        ModelUnavailableError: if nothing suitable exists, carrying a message that
             tells the user exactly what to run.
     """
     if kind not in ("receiver", "shot"):
@@ -132,35 +134,51 @@ def load_head(kind: str, model_arg: str | Path | None = None) -> tuple[Any, dict
         elif given.exists():
             path = given
         else:
-            raise ModelUnavailable(f"--model path does not exist: {given}")
+            raise ModelUnavailableError(f"--model path does not exist: {given}")
 
     if path is not None:
         try:
             model, card = models.load_model(path)
         except FileNotFoundError as exc:
-            raise ModelUnavailable(_train_hint(kind, path)) from exc
+            raise ModelUnavailableError(_train_hint(kind, path)) from exc
         except Exception as exc:
-            raise ModelUnavailable(f"could not load checkpoint {path}: {exc}") from exc
+            raise ModelUnavailableError(f"could not load checkpoint {path}: {exc}") from exc
         expected = "ReceiverModel" if kind == "receiver" else "ShotModel"
         if type(model).__name__ == expected:
             return model, card
         # a single file of the other kind: fall through to the bundled asset
         if Path(model_arg).is_dir():
-            raise ModelUnavailable(
+            raise ModelUnavailableError(
                 f"{path} holds a {type(model).__name__}, not a {expected}"
             )
 
     try:
         return models.load_bundled(kind)
     except FileNotFoundError as exc:
-        raise ModelUnavailable(_train_hint(kind, models.ASSETS_DIR / f"{kind}.pt")) from exc
+        raise ModelUnavailableError(_train_hint(kind, models.ASSETS_DIR / f"{kind}.pt")) from exc
     except Exception as exc:
-        raise ModelUnavailable(f"could not load the bundled '{kind}' model: {exc}") from exc
+        raise ModelUnavailableError(f"could not load the bundled '{kind}' model: {exc}") from exc
 
 
 # --------------------------------------------------------------------------- #
 # corner loading
 # --------------------------------------------------------------------------- #
+def _tune_torch_threads() -> None:
+    """Score single threaded unless the user asked otherwise.
+
+    A corner graph has twenty-odd nodes; spreading that over the machine's cores
+    costs more in synchronisation than it saves, and measurably doubles the time
+    per evaluation, which the suggestion search pays hundreds of times over.
+    """
+    import os
+
+    if any(os.environ.get(k) for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS")):
+        return
+    import torch
+
+    torch.set_num_threads(1)
+
+
 def _load_frames(path: str | Path) -> list[CornerFrame]:
     """Load one corner file, or every corner in a ``.jsonl`` dataset."""
     path = Path(path)
@@ -186,20 +204,6 @@ def demo_frames() -> list[CornerFrame]:
             f"no bundled demo corners in {DEMO_DIR}; the package install looks incomplete"
         )
     return [_io.load_corner(p) for p in paths]
-
-
-def _describe(frame: CornerFrame) -> str:
-    """One-line provenance for a corner, using whatever metadata it carries."""
-    bits: list[str] = []
-    if frame.competition:
-        bits.append(str(frame.competition))
-    if frame.season:
-        bits.append(str(frame.season))
-    if frame.match_id is not None:
-        bits.append(f"match {frame.match_id}")
-    if frame.minute is not None:
-        bits.append(f"{frame.minute}'")
-    return ", ".join(bits)
 
 
 def _short_id(corner_id: str) -> str:
@@ -490,8 +494,7 @@ def suggest_frame(
 
 def _moves_text(moves: Sequence[dict]) -> str:
     return "; ".join(
-        f"#{m['player_idx']} {m['from'][0]:.1f},{m['from'][1]:.1f}"
-        f" -> {m['to'][0]:.1f},{m['to'][1]:.1f} ({m['length']:.1f}m)"
+        f"#{m['player_idx']} -> {m['to'][0]:.1f},{m['to'][1]:.1f} ({m['length']:.1f}m)"
         for m in moves
     )
 
@@ -588,6 +591,7 @@ def format_suggestions(results: Sequence[dict], fmt: str) -> str:
 # --------------------------------------------------------------------------- #
 def _cmd_score(args: argparse.Namespace, out: Any) -> int:
     frames = _load_frames(args.corner)
+    _tune_torch_threads()
     receiver_model, _ = load_head("receiver", args.model)
     shot_model, _ = load_head("shot", args.model)
     results = [score_frame(f, receiver_model, shot_model) for f in frames]
@@ -596,9 +600,8 @@ def _cmd_score(args: argparse.Namespace, out: Any) -> int:
 
 
 def _cmd_suggest(args: argparse.Namespace, out: Any) -> int:
-    if args.defend and args.attack:
-        raise ValueError("--defend and --attack are mutually exclusive")
     frames = _load_frames(args.corner)
+    _tune_torch_threads()
     shot_model, _ = load_head("shot", args.model)
     results = [
         suggest_frame(
@@ -618,9 +621,14 @@ def _cmd_suggest(args: argparse.Namespace, out: Any) -> int:
 
 
 def _cmd_demo(args: argparse.Namespace, out: Any) -> int:
+    import time
+
+    started = time.perf_counter()
     frames = demo_frames()
+    _tune_torch_threads()
     receiver_model, receiver_card = load_head("receiver", args.model)
     shot_model, _ = load_head("shot", args.model)
+    loaded = time.perf_counter()
 
     scores = [score_frame(f, receiver_model, shot_model) for f in frames]
     plans = [
@@ -644,6 +652,8 @@ def _cmd_demo(args: argparse.Namespace, out: Any) -> int:
                 {"score": s, "suggest": p} for s, p in zip(scores, plans, strict=True)
             ],
             "model_card_date": receiver_card.get("date"),
+            "seconds": round(time.perf_counter() - started, 2),
+            "startup_seconds": round(loaded - started, 2),
         }
         print(json.dumps(payload, indent=2), file=out)
         return EXIT_OK
@@ -653,7 +663,7 @@ def _cmd_demo(args: argparse.Namespace, out: Any) -> int:
         print(format_suggestions(plans, "csv"), file=out)
         return EXIT_OK
 
-    print("setpiece demo — three real Euro 2024 corners, scored offline", file=out)
+    print("setpiece demo: three real Euro 2024 corners, scored offline", file=out)
     print("=" * 70, file=out)
     for score, plan in zip(scores, plans, strict=True):
         print(file=out)
@@ -661,6 +671,13 @@ def _cmd_demo(args: argparse.Namespace, out: Any) -> int:
         print(file=out)
         print(_pretty_suggestion(plan), file=out)
         print("-" * 70, file=out)
+    print(
+        f"scored and searched {len(frames)} corners in "
+        f"{time.perf_counter() - loaded:.1f}s "
+        f"(plus {loaded - started:.1f}s to import torch and load the checkpoints), "
+        f"no network access",
+        file=out,
+    )
     return EXIT_OK
 
 
@@ -724,16 +741,24 @@ def _cmd_fetch(args: argparse.Namespace, out: Any) -> int:
 
 
 def _cmd_train(args: argparse.Namespace, out: Any) -> int:
-    """Hand off to :mod:`setpiece.train`, imported lazily so the CLI never needs it."""
+    return run_train(list(args.train_args))
+
+
+def run_train(extra: Sequence[str]) -> int:
+    """Hand off to :mod:`setpiece.train`, imported lazily so the CLI never needs it.
+
+    Arguments are forwarded verbatim; this wrapper deliberately knows nothing
+    about the training module's own flags.
+    """
     try:
         from setpiece import train as train_mod
     except ImportError as exc:
         print(f"error: setpiece.train is unavailable: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
-    extra = list(args.train_args)
-    if extra and extra[0] == "--":
-        extra = extra[1:]
+    forwarded = list(extra)
+    if forwarded and forwarded[0] == "--":
+        forwarded = forwarded[1:]
 
     entry = None
     for name in ("main", "cli", "run"):
@@ -747,7 +772,7 @@ def _cmd_train(args: argparse.Namespace, out: Any) -> int:
             file=sys.stderr,
         )
         return EXIT_ERROR
-    result = entry(extra)
+    result = entry(forwarded)
     return EXIT_OK if result is None else int(result)
 
 
@@ -793,12 +818,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_suggest = sub.add_parser("suggest", help="rank small defensive adjustments")
     p_suggest.add_argument("corner", help="corner JSON/CSV file, or a .jsonl dataset")
-    p_suggest.add_argument(
+    objective = p_suggest.add_mutually_exclusive_group()
+    objective.add_argument(
         "--defend",
         action="store_true",
         help="minimise the shot probability (the default)",
     )
-    p_suggest.add_argument(
+    objective.add_argument(
         "--attack",
         action="store_true",
         help="maximise it instead, to show where the shape breaks",
@@ -890,22 +916,46 @@ def build_parser() -> argparse.ArgumentParser:
 # --------------------------------------------------------------------------- #
 # entry point
 # --------------------------------------------------------------------------- #
+def _train_passthrough(tokens: Sequence[str]) -> tuple[list[str], bool] | None:
+    """Split ``train`` off before argparse sees it, or return ``None``.
+
+    ``argparse.REMAINDER`` drops the first argument when it starts with a dash,
+    so ``setpiece train --epochs 20`` would lose ``--epochs``. Peeling the
+    subcommand off by hand keeps the forwarding verbatim and lets
+    ``setpiece train --help`` reach the training module's own help.
+    """
+    verbose = False
+    for i, tok in enumerate(tokens):
+        if tok in ("-v", "--verbose"):
+            verbose = True
+            continue
+        return (list(tokens[i + 1 :]), verbose) if tok == "train" else None
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one subcommand. Returns the process exit code; never raises for user error."""
+    tokens = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
-    args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
 
-    if getattr(args, "command", None) is None:
-        parser.print_help()
-        return EXIT_USAGE
+    passthrough = _train_passthrough(tokens)
+    if passthrough is not None:
+        forwarded, verbose = passthrough
+        if verbose:
+            logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+        action: Any = partial(run_train, forwarded)
+    else:
+        args = parser.parse_args(tokens)
+        if getattr(args, "command", None) is None:
+            parser.print_help()
+            return EXIT_USAGE
+        if args.verbose:
+            logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+        action = partial(args.func, args, sys.stdout)
 
-    if args.verbose:
-        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-
-    out = sys.stdout
     try:
-        return int(args.func(args, out))
-    except ModelUnavailable as exc:
+        return int(action())
+    except ModelUnavailableError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_NO_MODEL
     except BrokenPipeError:
