@@ -32,6 +32,7 @@ def build_dataset(
     only_competitions: list[str] | None = None,
     max_matches: int | None = None,
     keep_raw: bool = False,
+    max_attempts: int = 3,
 ) -> dict:
     """Fetch and extract corners into ``out_path`` (JSON lines). Returns a summary."""
     out_path = Path(out_path)
@@ -44,6 +45,10 @@ def build_dataset(
     failures: list[dict] = state.get("failures", [])
     #: seasons flagged as having 360 data whose freeze-frame files are absent upstream
     no_360: dict[str, int] = state.get("no_360", {})
+    #: match_id -> consecutive failure count, so a permanently broken match is not
+    #: re-downloaded on every run. Match 3845506 has malformed JSON upstream and
+    #: would otherwise cost ~7 MB and a failure row on each pass.
+    attempts: dict[str, int] = {str(k): int(v) for k, v in state.get("attempts", {}).items()}
 
     seasons = list_360_seasons(raw_dir)
     if only_competitions:
@@ -62,6 +67,15 @@ def build_dataset(
             targets.append((m["match_id"], s))
 
     targets = [t for t in targets if t[0] not in done]
+    gave_up = [t for t in targets if attempts.get(str(t[0]), 0) >= max_attempts]
+    if gave_up:
+        log.warning(
+            "skipping %d match(es) that failed %d times already: %s",
+            len(gave_up),
+            max_attempts,
+            ", ".join(str(t[0]) for t in gave_up[:10]),
+        )
+    targets = [t for t in targets if attempts.get(str(t[0]), 0) < max_attempts]
     if max_matches is not None:
         targets = targets[:max_matches]
 
@@ -84,9 +98,23 @@ def build_dataset(
                     report=report,
                 )
             except Exception as exc:
-                failures.append({"match_id": match_id, "error": str(exc)})
-                log.warning("match %s failed: %s", match_id, exc)
+                n = attempts.get(str(match_id), 0) + 1
+                attempts[str(match_id)] = n
+                # one row per match, updated in place, rather than one per attempt
+                for row in failures:
+                    if row.get("match_id") == match_id:
+                        row.update({"error": str(exc), "attempts": n})
+                        break
+                else:
+                    failures.append({"match_id": match_id, "error": str(exc), "attempts": n})
+                if n >= max_attempts:
+                    log.warning(
+                        "match %s failed %d times, giving up on it: %s", match_id, n, exc
+                    )
+                else:
+                    log.warning("match %s failed (attempt %d): %s", match_id, n, exc)
                 continue
+            attempts.pop(str(match_id), None)
             if not report.get("has_360", True):
                 key = f"{season['competition']} {season['season']}"
                 no_360[key] = no_360.get(key, 0) + 1
@@ -104,6 +132,7 @@ def build_dataset(
                             "n_corners": n_corners,
                             "failures": failures,
                             "no_360": no_360,
+                            "attempts": attempts,
                         }
                     )
                 )
@@ -116,6 +145,7 @@ def build_dataset(
                 "n_corners": n_corners,
                 "failures": failures,
                 "no_360": no_360,
+                "attempts": attempts,
             }
         )
     )
@@ -127,4 +157,6 @@ def build_dataset(
         "corners": n_corners,
         "failures": failures,
         "no_360": no_360,
+        "attempts": attempts,
+        "gave_up": sorted(int(k) for k, v in attempts.items() if v >= max_attempts),
     }

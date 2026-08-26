@@ -9,8 +9,9 @@ the package may edit them. `setpiece/types.py`, `setpiece/_io.py` and
 - Metres on a 105x68 pitch. The attacking team always attacks towards **+x**.
 - Goal centre `(105.0, 34.0)`; posts at `y = 30.34` and `y = 37.66`.
 - Corner takers sit at `x ~= 105`, `y ~= 0` or `y ~= 68`.
-- Freeze frames are **anonymous** (no player ids) and **variable size**
-  (typically 12-22 visible players, not always 22).
+- Freeze frames are **anonymous** (no player ids) and **variable size**.
+  Measured over the 2464-corner dataset: **8 to 22 players, median 19**. Frames
+  showing fewer than 8 players are dropped at load time.
 - Freeze frames carry **no velocities**. Never fabricate them. Docs say
   `--assume-static`.
 
@@ -39,9 +40,19 @@ FEATURE_NAMES: list[str]          # length N_NODE_FEATURES, human readable
 N_NODE_FEATURES: int
 N_EDGE_FEATURES: int
 
-def build_graph(frame: CornerFrame) -> torch_geometric.data.Data: ...
+def build_graph(frame: CornerFrame) -> CornerData: ...
 def build_flat(frame: CornerFrame) -> np.ndarray:  # [N, N_NODE_FEATURES], baseline use
+def global_receiver_index(data) -> Tensor: ...     # int64 [B], -1 passed through
 ```
+
+`CornerData` is a `torch_geometric.data.Data` **subclass** that pins
+`__inc__("y_receiver") == 0`, so `y_receiver` survives batching as a
+**graph-local** node index. The batch-global index is
+`batch.ptr[b] + batch.y_receiver[b]`; use `global_receiver_index(batch)`, which
+does that and passes the `-1` sentinel through unshifted. There is no `__inc__`
+formulation that both shifts real indices and preserves `-1`, because PyG applies
+graph `b`'s increment from the cumulative sum of graphs `0..b-1` — a
+value-dependent increment silently turns `-1` into a valid-looking node index.
 
 `build_graph` returns a `Data` with exactly these attributes:
 
@@ -140,8 +151,18 @@ class Suggestion:
     delta: float           # new_prob - base_prob, negative is an improvement
 
 def suggest(frame, shot_model, *, movers=3, max_move=3.0, min_sep=0.5,
-            beam=8, seed=0, defend=True) -> list[Suggestion]: ...
+            beam=8, seed=0, defend=True,
+            max_evals=288, move_keeper=False, top_k=None,
+            max_candidates=MAX_CANDIDATE_DEFENDERS,
+            deep_candidates=DEEP_CANDIDATE_DEFENDERS) -> list[Suggestion]: ...
 ```
+
+`max_evals` bounds model evaluations so the app stays interactive. `move_keeper`
+is a default, not a constraint. `max_candidates` / `deep_candidates` bound the
+branching factor: only the *N* defenders nearest the goal are candidates for the
+first move, and only the nearest *M* at deeper levels. On a frame with ten
+outfield defenders the remainder can never be repositioned, so both are
+adjustable and surfaced by the CLI rather than being silent.
 
 Hard constraints, which the tests assert:
 
@@ -160,12 +181,23 @@ Return suggestions ranked by `delta` ascending (best improvement first).
 
 ```
 setpiece score   <corner> [--format json|csv|pretty] [--model PATH]
-setpiece suggest <corner> [--defend] [--movers 3] [--max-move 3.0] [--seed 0]
-setpiece demo
-setpiece app
-setpiece fetch   [--competition NAME] [--max-matches N]   # wraps setpiece.fetch
-setpiece train   [...]                                     # wraps setpiece.train
+setpiece suggest <corner> [--defend | --attack] [--movers 3] [--max-move 3.0]
+                          [--seed 0] [--beam 8] [--top-k N] [--format ...]
+                          [--max-candidates N] [--deep-candidates N]
+setpiece demo    [--format ...] [--model PATH]
+setpiece app     [--port 8501] [--headless] [--model PATH]
+setpiece fetch   [--competition NAME] [--max-matches N] [--max-attempts 3]
+setpiece train   [--install] [...]                         # wraps setpiece.train
 ```
+
+`train` writes checkpoints to `--out-dir` (default `runs/latest`); `--install`
+additionally copies them over the bundled ones in `setpiece/assets/`, which is
+what `score`, `suggest`, `demo` and the app load by default.
+
+`app` must pin `torch.set_num_threads(1)` inside `app.py`'s own `main()`. It is
+launched as a fresh `streamlit run` subprocess, so no setting made in `cli.py`
+reaches it, and at torch's default thread count a `suggest()` call takes 2.5-2.9 s
+against 0.6 s pinned — which breaks the under-1-second interaction budget.
 
 `main(argv=None) -> int`. `demo` runs on the three bundled Euro 2024 corners in
 `setpiece/assets/demo/`, offline, in under 10 s, and must not touch the network.
