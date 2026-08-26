@@ -65,6 +65,21 @@ SHOT_WINDOW = 5
 #: same as labelling: ``shot_within_5`` stays event-based.
 SHOT_LOOKAHEAD_EVENTS = 40
 
+#: Plausibility guards on the event-count windows above.
+#:
+#: The windows are counts, not durations, so they walk straight through a dead
+#: ball: measured over 2464 corners, the first "touch" landed a median 1.61 s
+#: after the delivery (p90 2.53 s) but 110 rows were more than 10 s later, up to
+#: 238 s, and 102 of those were being scored as "the defence won first contact".
+#: An event that far away is a different phase of play, not this corner.
+#:
+#: These are guards, not a redefinition: the labels stay event-based per the
+#: spec, and a touch or shot outside the window is discarded rather than
+#: relabelled. FIRST_TOUCH_MAX_S is roughly four times the observed p90; the
+#: shot guard is looser because a genuine corner scramble can run on.
+FIRST_TOUCH_MAX_S = 10.0
+SHOT_MAX_S = 15.0
+
 
 # --------------------------------------------------------------------------- #
 # coordinates
@@ -297,11 +312,20 @@ def corners_from_match(
             continue
 
         attacking_team_id = ev.get("team", {}).get("id")
-        shot = _shot_within(events, idx, attacking_team_id)
+        shot_n_events, shot_dt = _first_attacking_shot(events, idx, attacking_team_id)
+        # event-count window per the spec, plus a plausibility guard so a dead ball
+        # cannot drag an unrelated shot into the label
+        shot = _shot_within(events, idx, attacking_team_id) and (
+            shot_dt is not None and shot_dt <= SHOT_MAX_S
+        )
 
         receiver_idx: int | None = None
         match_dist: float | None = None
         touch = _first_touch(events, idx)
+        first_touch_dt = _elapsed(ev, touch) if touch is not None else None
+        if touch is not None and (first_touch_dt is None or first_touch_dt > FIRST_TOUCH_MAX_S):
+            # too far away in time to be this corner's first contact
+            touch = None
         if touch is None:
             first_touch = "unknown"
         elif touch.get("team", {}).get("id") != attacking_team_id:
@@ -327,8 +351,6 @@ def corners_from_match(
 
         pass_info = ev.get("pass", {})
         end_loc = pass_info.get("end_location")
-        shot_n_events, shot_dt = _first_attacking_shot(events, idx, attacking_team_id)
-        first_touch_dt = _elapsed(ev, touch) if touch is not None else None
         out.append(
             CornerFrame(
                 corner_id=ev["id"],
