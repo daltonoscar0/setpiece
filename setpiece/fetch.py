@@ -45,6 +45,9 @@ def build_dataset(
     failures: list[dict] = state.get("failures", [])
     #: seasons flagged as having 360 data whose freeze-frame files are absent upstream
     no_360: dict[str, int] = state.get("no_360", {})
+    #: per-season {corners_seen, corners_with_frame, dropped_too_few_players}, so the
+    #: 360 coverage fraction is measured rather than quoted
+    coverage: dict[str, dict] = state.get("coverage", {})
     #: match_id -> consecutive failure count, so a permanently broken match is not
     #: re-downloaded on every run. Match 3845506 has malformed JSON upstream and
     #: would otherwise cost ~7 MB and a failure row on each pass.
@@ -115,6 +118,15 @@ def build_dataset(
                     log.warning("match %s failed (attempt %d): %s", match_id, n, exc)
                 continue
             attempts.pop(str(match_id), None)
+            cov = report.get("counts") or {}
+            if cov:
+                key = f"{season['competition']} {season['season']}"
+                agg = coverage.setdefault(
+                    key,
+                    {"corners_seen": 0, "corners_with_frame": 0, "dropped_too_few_players": 0},
+                )
+                for k in agg:
+                    agg[k] += int(cov.get(k, 0))
             if not report.get("has_360", True):
                 key = f"{season['competition']} {season['season']}"
                 no_360[key] = no_360.get(key, 0) + 1
@@ -133,6 +145,7 @@ def build_dataset(
                             "failures": failures,
                             "no_360": no_360,
                             "attempts": attempts,
+                            "coverage": coverage,
                         }
                     )
                 )
@@ -146,6 +159,7 @@ def build_dataset(
                 "failures": failures,
                 "no_360": no_360,
                 "attempts": attempts,
+                "coverage": coverage,
             }
         )
     )
@@ -158,5 +172,6 @@ def build_dataset(
         "failures": failures,
         "no_360": no_360,
         "attempts": attempts,
+        "coverage": coverage,
         "gave_up": sorted(int(k) for k, v in attempts.items() if v >= max_attempts),
     }

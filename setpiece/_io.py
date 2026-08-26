@@ -56,8 +56,14 @@ TOUCH_TYPES = frozenset(
 #: as ambiguous and the label is dropped.
 RECEIVER_MATCH_MAX_M = 8.0
 
-#: How many events after the corner are scanned for a shot.
+#: How many events after the corner are scanned for a shot. This is the spec's
+#: definition of the shot label and is what ``shot_within_5`` records.
 SHOT_WINDOW = 5
+
+#: How far ahead to look when recording *timings*, so a time-based variant of the
+#: shot label can be derived offline without re-downloading. Recording is not the
+#: same as labelling: ``shot_within_5`` stays event-based.
+SHOT_LOOKAHEAD_EVENTS = 40
 
 
 # --------------------------------------------------------------------------- #
@@ -187,6 +193,53 @@ def _shot_within(events: list[dict], idx: int, attacking_team_id: int) -> bool:
     return False
 
 
+def _event_seconds(ev: dict) -> float | None:
+    """Seconds elapsed within the event's own period.
+
+    Prefers the sub-second ``timestamp`` field; falls back to the match clock.
+    Only comparable between events of the same ``period``.
+    """
+    ts = ev.get("timestamp")
+    if isinstance(ts, str):
+        try:
+            hh, mm, ss = ts.split(":")
+            return int(hh) * 3600 + int(mm) * 60 + float(ss)
+        except (ValueError, TypeError):
+            pass
+    minute, second = ev.get("minute"), ev.get("second")
+    if minute is None or second is None:
+        return None
+    return float(minute) * 60.0 + float(second)
+
+
+def _elapsed(corner: dict, ev: dict) -> float | None:
+    """Seconds from ``corner`` to ``ev``, or None across a period boundary."""
+    if corner.get("period") != ev.get("period"):
+        return None
+    t0, t1 = _event_seconds(corner), _event_seconds(ev)
+    if t0 is None or t1 is None:
+        return None
+    return round(t1 - t0, 3)
+
+
+def _first_attacking_shot(
+    events: list[dict], idx: int, attacking_team_id: int
+) -> tuple[int | None, float | None]:
+    """``(events after the corner, seconds after it)`` for the first attacking shot.
+
+    Looks further ahead than the label window so a time-based variant of the shot
+    label can be evaluated offline. Returns ``(None, None)`` if no shot is found.
+    """
+    corner = events[idx]
+    for offset, ev in enumerate(events[idx + 1 : idx + 1 + SHOT_LOOKAHEAD_EVENTS], start=1):
+        if (
+            ev.get("type", {}).get("name") == "Shot"
+            and ev.get("team", {}).get("id") == attacking_team_id
+        ):
+            return offset, _elapsed(corner, ev)
+    return None, None
+
+
 def _players_from_freeze(frame: list[dict]) -> list[Player]:
     players: list[Player] = []
     for p in frame:
@@ -213,22 +266,34 @@ def corners_from_match(
     match_id: int | None = None,
     competition: str | None = None,
     season: str | None = None,
+    counts: dict | None = None,
 ) -> list[CornerFrame]:
     """Extract every corner that carries a freeze frame, with labels attached.
 
-    Roughly half of open-data corners have no 360 frame; those are skipped.
+    A substantial share of open-data corners have no 360 frame and are skipped.
+    Pass ``counts`` to receive the real tally - ``corners_seen``,
+    ``corners_with_frame`` and ``dropped_too_few_players`` - so the coverage
+    fraction is a measurement rather than an estimate.
     """
     frames = {f["event_uuid"]: f for f in three_sixty if f.get("event_uuid")}
     out: list[CornerFrame] = []
+    if counts is None:
+        counts = {}
+    counts.setdefault("corners_seen", 0)
+    counts.setdefault("corners_with_frame", 0)
+    counts.setdefault("dropped_too_few_players", 0)
 
     for idx, ev in enumerate(events):
         if not _is_corner(ev):
             continue
+        counts["corners_seen"] += 1
         frame = frames.get(ev["id"])
         if frame is None or not frame.get("freeze_frame"):
             continue
+        counts["corners_with_frame"] += 1
         players = _players_from_freeze(frame["freeze_frame"])
         if len(players) < 8:
+            counts["dropped_too_few_players"] += 1
             continue
 
         attacking_team_id = ev.get("team", {}).get("id")
@@ -262,6 +327,8 @@ def corners_from_match(
 
         pass_info = ev.get("pass", {})
         end_loc = pass_info.get("end_location")
+        shot_n_events, shot_dt = _first_attacking_shot(events, idx, attacking_team_id)
+        first_touch_dt = _elapsed(ev, touch) if touch is not None else None
         out.append(
             CornerFrame(
                 corner_id=ev["id"],
@@ -286,6 +353,12 @@ def corners_from_match(
                     "end_xy": list(sb_to_metres(float(end_loc[0]), float(end_loc[1])))
                     if end_loc
                     else None,
+                    # Timings, recorded so a time-based variant of either label can
+                    # be derived offline. The shipped labels stay event-based, per
+                    # the spec. LABEL-ADJACENT: never model features.
+                    "first_touch_dt": first_touch_dt,
+                    "shot_dt": shot_dt,
+                    "shot_n_events": shot_n_events,
                 },
             )
         )
@@ -320,9 +393,18 @@ def fetch_match_corners(
         three_sixty = []
     if report is not None:
         report["has_360"] = bool(three_sixty)
-    return corners_from_match(
-        events, three_sixty, match_id=match_id, competition=competition, season=season
+    counts: dict = {}
+    corners = corners_from_match(
+        events,
+        three_sixty,
+        match_id=match_id,
+        competition=competition,
+        season=season,
+        counts=counts,
     )
+    if report is not None:
+        report["counts"] = counts
+    return corners
 
 
 # --------------------------------------------------------------------------- #
