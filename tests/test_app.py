@@ -540,6 +540,108 @@ def test_top_receiver_index(frame: CornerFrame) -> None:
     assert app.top_receiver_index(frame, scores) == 5
 
 
+# --------------------------------------------------------------------------- #
+# torch thread pinning
+# --------------------------------------------------------------------------- #
+def _pin_in_a_fresh_interpreter(env_overrides: dict[str, str]) -> tuple[int, int]:
+    """Import the app in a clean process, pin, and report the thread count.
+
+    A subprocess is the only honest way to check the ``OMP_NUM_THREADS`` branch:
+    torch reads that variable once, when it is imported, so it has to be set
+    before the interpreter starts. Nothing here launches a Streamlit server; it
+    imports the module and calls one function.
+    """
+    import os
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items() if k not in ("OMP_NUM_THREADS", "MKL_NUM_THREADS")}
+    env.update(env_overrides)
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import torch; from setpiece import app; "
+            "print(app.pin_torch_threads(), torch.get_num_threads())",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        env=env,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr
+    returned, effective = proc.stdout.strip().splitlines()[-1].split()
+    return (int(returned), int(effective))
+
+
+def test_pin_torch_threads_pins_to_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    import torch
+
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    monkeypatch.delenv("MKL_NUM_THREADS", raising=False)
+    before = torch.get_num_threads()
+    try:
+        assert app.pin_torch_threads() == 1
+        assert torch.get_num_threads() == 1
+    finally:
+        torch.set_num_threads(before)
+
+
+def test_pin_torch_threads_respects_an_explicit_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An OMP_NUM_THREADS the user set is left alone, whatever its value."""
+    import torch
+
+    monkeypatch.setenv("OMP_NUM_THREADS", "3")
+    monkeypatch.delenv("MKL_NUM_THREADS", raising=False)
+
+    def _refuse(_: int) -> None:
+        raise AssertionError("pin_torch_threads overrode an explicit OMP_NUM_THREADS")
+
+    monkeypatch.setattr(torch, "set_num_threads", _refuse)
+    assert app.pin_torch_threads() == torch.get_num_threads()
+
+
+@pytest.mark.slow  # about 4 s: a second interpreter has to import torch
+def test_pin_torch_threads_survives_a_fresh_interpreter() -> None:
+    """The pin has to work in the process ``streamlit run`` actually starts."""
+    returned, effective = _pin_in_a_fresh_interpreter({})
+    assert (returned, effective) == (1, 1)
+
+
+@pytest.mark.slow
+def test_an_explicit_thread_count_reaches_a_fresh_interpreter() -> None:
+    returned, effective = _pin_in_a_fresh_interpreter({"OMP_NUM_THREADS": "2"})
+    assert (returned, effective) == (2, 2)
+
+
+def test_main_pins_before_it_touches_a_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``main`` pins on every Streamlit rerun, before any scoring happens.
+
+    Streamlit re-executes the script top to bottom on each interaction, so the
+    pin cannot live at import time only. This drives ``main`` far enough to see
+    the call and then stops it, without starting a server.
+    """
+    calls: list[str] = []
+
+    def _record_pin() -> int:
+        calls.append("pin")
+        return 1
+
+    class _StopEarlyError(Exception):
+        pass
+
+    def _stop(*_args: object, **_kwargs: object) -> None:
+        calls.append("page_config")
+        raise _StopEarlyError
+
+    monkeypatch.setattr(app, "pin_torch_threads", _record_pin)
+    monkeypatch.setattr(app.st, "set_page_config", _stop)
+    with pytest.raises(_StopEarlyError):
+        app.main()
+    assert calls == ["pin", "page_config"]
+
+
 def test_static_note_is_visible_text() -> None:
     assert "no velocities" in app.STATIC_NOTE
     assert "static" in app.STATIC_NOTE

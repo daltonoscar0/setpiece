@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
 from setpiece._io import read_corners
@@ -45,6 +46,19 @@ def corners() -> list[CornerFrame]:
     return frames
 
 
+@pytest.fixture(scope="module")
+def graphs(corners: list[CornerFrame]) -> list[Data]:
+    """One graph per smoke corner, built once for the whole module.
+
+    Most tests below only read the graph they are handed, and ``build_graph`` is
+    deterministic (``test_deterministic`` asserts exactly that on freshly built
+    pairs), so rebuilding all eighteen graphs inside every test bought nothing
+    but wall clock. Anything that needs a *fresh* graph — determinism, or the
+    poisoned-input comparisons — still calls ``build_graph`` itself.
+    """
+    return [build_graph(f) for f in corners]
+
+
 def synthetic_frame(**kwargs: object) -> CornerFrame:
     """A small hand-built corner: 3 attackers (one taker), 3 defenders (one keeper)."""
     players = [
@@ -70,9 +84,8 @@ def test_feature_name_lengths() -> None:
         assert required in FEATURE_NAMES
 
 
-def test_graph_attribute_contract(corners: list[CornerFrame]) -> None:
-    for frame in corners:
-        g = build_graph(frame)
+def test_graph_attribute_contract(corners: list[CornerFrame], graphs: list[Data]) -> None:
+    for frame, g in zip(corners, graphs, strict=True):
         n = len(frame.players)
 
         assert g.num_nodes == n
@@ -102,17 +115,15 @@ def test_graph_attribute_contract(corners: list[CornerFrame]) -> None:
         assert g.y_shot.item() in (0.0, 1.0)
 
 
-def test_flags_match_the_frame(corners: list[CornerFrame]) -> None:
-    for frame in corners:
-        g = build_graph(frame)
+def test_flags_match_the_frame(corners: list[CornerFrame], graphs: list[Data]) -> None:
+    for frame, g in zip(corners, graphs, strict=True):
         assert g.is_attacker.tolist() == [p.is_attacker for p in frame.players]
         assert g.is_taker.tolist() == [p.is_taker for p in frame.players]
         assert g.is_keeper.tolist() == [p.is_keeper for p in frame.players]
 
 
-def test_no_nans_and_roughly_unit_range(corners: list[CornerFrame]) -> None:
-    for frame in corners:
-        g = build_graph(frame)
+def test_no_nans_and_roughly_unit_range(graphs: list[Data]) -> None:
+    for g in graphs:
         assert torch.isfinite(g.x).all()
         assert torch.isfinite(g.edge_attr).all()
         assert g.x.abs().max().item() <= 5.0
@@ -121,13 +132,13 @@ def test_no_nans_and_roughly_unit_range(corners: list[CornerFrame]) -> None:
         assert g.x.std(dim=0).max().item() > 0.0
 
 
-def test_build_flat_matches_graph_x(corners: list[CornerFrame]) -> None:
-    for frame in corners:
+def test_build_flat_matches_graph_x(corners: list[CornerFrame], graphs: list[Data]) -> None:
+    for frame, g in zip(corners, graphs, strict=True):
         flat = build_flat(frame)
         assert isinstance(flat, np.ndarray)
         assert flat.dtype == np.float32
         assert flat.shape == (len(frame.players), N_NODE_FEATURES)
-        np.testing.assert_allclose(flat, build_graph(frame).x.numpy())
+        np.testing.assert_allclose(flat, g.x.numpy())
 
 
 def test_deterministic(corners: list[CornerFrame]) -> None:
@@ -216,9 +227,8 @@ def test_features_respond_to_movement() -> None:
 # --------------------------------------------------------------------------- #
 # edges
 # --------------------------------------------------------------------------- #
-def test_edges_are_symmetric_and_loop_free(corners: list[CornerFrame]) -> None:
-    for frame in corners:
-        g = build_graph(frame)
+def test_edges_are_symmetric_and_loop_free(graphs: list[Data]) -> None:
+    for g in graphs:
         edges = {(int(a), int(b)) for a, b in g.edge_index.t().tolist()}
         assert edges, "expected a non-empty edge set"
         for a, b in edges:
@@ -227,12 +237,11 @@ def test_edges_are_symmetric_and_loop_free(corners: list[CornerFrame]) -> None:
             assert 0 <= a < g.num_nodes and 0 <= b < g.num_nodes
 
 
-def test_taker_is_connected_to_everyone(corners: list[CornerFrame]) -> None:
-    for frame in corners:
+def test_taker_is_connected_to_everyone(corners: list[CornerFrame], graphs: list[Data]) -> None:
+    for frame, g in zip(corners, graphs, strict=True):
         taker = frame.taker_index
         if taker is None:
             continue
-        g = build_graph(frame)
         src, dst = g.edge_index
         nbrs = set(dst[src == taker].tolist())
         assert nbrs == set(range(g.num_nodes)) - {taker}
@@ -265,9 +274,10 @@ def test_single_player_frame_has_no_edges() -> None:
 # --------------------------------------------------------------------------- #
 # candidate mask
 # --------------------------------------------------------------------------- #
-def test_candidate_mask_is_attackers_minus_taker(corners: list[CornerFrame]) -> None:
-    for frame in corners:
-        g = build_graph(frame)
+def test_candidate_mask_is_attackers_minus_taker(
+    corners: list[CornerFrame], graphs: list[Data]
+) -> None:
+    for frame, g in zip(corners, graphs, strict=True):
         expected = set(frame.attacker_indices) - {frame.taker_index}
         assert set(torch.nonzero(g.candidate_mask).flatten().tolist()) == expected
         assert not (g.candidate_mask & g.is_taker).any()
@@ -326,12 +336,11 @@ def test_receiver_outside_the_candidate_set_is_dropped() -> None:
         assert g.y_receiver.item() == -1
 
 
-def test_real_label_semantics(corners: list[CornerFrame]) -> None:
+def test_real_label_semantics(corners: list[CornerFrame], graphs: list[Data]) -> None:
     seen_valid_receiver = False
     seen_defence = False
     seen_dropped = False
-    for frame in corners:
-        g = build_graph(frame)
+    for frame, g in zip(corners, graphs, strict=True):
         y = g.y_receiver.item()
         valid = g.y_receiver_valid.item()
         if frame.first_touch == "attacker" and frame.receiver_idx is not None:
@@ -351,9 +360,8 @@ def test_real_label_semantics(corners: list[CornerFrame]) -> None:
 # --------------------------------------------------------------------------- #
 # batching
 # --------------------------------------------------------------------------- #
-def test_batching_lines_up_with_per_graph_values(corners: list[CornerFrame]) -> None:
-    frames = corners[:8]
-    graphs = [build_graph(f) for f in frames]
+def test_batching_lines_up_with_per_graph_values(graphs: list[Data]) -> None:
+    graphs = graphs[:8]
     loader = DataLoader(graphs, batch_size=len(graphs), shuffle=False)
     batch = next(iter(loader))
 
@@ -382,8 +390,8 @@ def test_batching_lines_up_with_per_graph_values(corners: list[CornerFrame]) -> 
     assert tuple(batch.y_shot.shape) == (len(graphs),)
 
 
-def test_batched_edge_index_is_offset_per_graph(corners: list[CornerFrame]) -> None:
-    graphs = [build_graph(f) for f in corners[:6]]
+def test_batched_edge_index_is_offset_per_graph(graphs: list[Data]) -> None:
+    graphs = graphs[:6]
     batch = next(iter(DataLoader(graphs, batch_size=len(graphs), shuffle=False)))
     assert batch.edge_index.shape[1] == sum(g.edge_index.shape[1] for g in graphs)
     off = 0
@@ -398,9 +406,8 @@ def test_batched_edge_index_is_offset_per_graph(corners: list[CornerFrame]) -> N
         e0 += e
 
 
-def test_global_receiver_index_points_at_the_right_node(corners: list[CornerFrame]) -> None:
+def test_global_receiver_index_points_at_the_right_node(graphs: list[Data]) -> None:
     """The target must select the receiver's own feature row after batching."""
-    graphs = [build_graph(f) for f in corners]
     batch = next(iter(DataLoader(graphs, batch_size=len(graphs), shuffle=False)))
     gidx = global_receiver_index(batch)
 
@@ -423,8 +430,8 @@ def test_global_receiver_index_points_at_the_right_node(corners: list[CornerFram
         assert global_receiver_index(g).tolist() == g.y_receiver.tolist()
 
 
-def test_batch_round_trips(corners: list[CornerFrame]) -> None:
-    graphs = [build_graph(f) for f in corners[:7]]
+def test_batch_round_trips(graphs: list[Data]) -> None:
+    graphs = graphs[:7]
     batch = next(iter(DataLoader(graphs, batch_size=len(graphs), shuffle=False)))
     for original, restored in zip(graphs, batch.to_data_list(), strict=True):
         assert restored.num_nodes == original.num_nodes
@@ -437,9 +444,8 @@ def test_batch_round_trips(corners: list[CornerFrame]) -> None:
         assert torch.equal(restored.y_shot, original.y_shot)
 
 
-def test_variable_size_graphs_batch(corners: list[CornerFrame]) -> None:
+def test_variable_size_graphs_batch(graphs: list[Data]) -> None:
     """Freeze frames vary in size; several batch sizes must all work."""
-    graphs = [build_graph(f) for f in corners]
     assert len({g.num_nodes for g in graphs}) > 1, "expected variable frame sizes"
     for bs in (1, 2, 3, 5):
         seen = 0
@@ -454,10 +460,11 @@ def test_variable_size_graphs_batch(corners: list[CornerFrame]) -> None:
 # --------------------------------------------------------------------------- #
 # label leakage
 # --------------------------------------------------------------------------- #
-def test_features_ignore_label_adjacent_meta(corners: list[CornerFrame]) -> None:
+def test_features_ignore_label_adjacent_meta(
+    corners: list[CornerFrame], graphs: list[Data]
+) -> None:
     """end_xy and pass_outcome are label-adjacent: perturbing them changes nothing."""
-    for frame in corners[:6]:
-        g = build_graph(frame)
+    for frame, g in zip(corners[:6], graphs[:6], strict=True):
         flat = build_flat(frame)
 
         poisoned = frame.with_players(list(frame.players))
@@ -474,7 +481,9 @@ def test_features_ignore_label_adjacent_meta(corners: list[CornerFrame]) -> None
         np.testing.assert_array_equal(flat, build_flat(poisoned))
 
 
-def test_features_ignore_the_supervision_labels(corners: list[CornerFrame]) -> None:
+def test_features_ignore_the_supervision_labels(
+    corners: list[CornerFrame], graphs: list[Data]
+) -> None:
     """The outcome labels themselves must not reach ``x``, ``edge_attr`` or the mask.
 
     ``meta`` is the obvious trap and is covered above, but ``first_touch``,
@@ -482,8 +491,7 @@ def test_features_ignore_the_supervision_labels(corners: list[CornerFrame]) -> N
     the heads are trained against: if any of them changed a single feature the
     cross-validated numbers would be measuring themselves.
     """
-    for frame in corners:
-        g = build_graph(frame)
+    for frame, g in zip(corners, graphs, strict=True):
         flat = build_flat(frame)
 
         poisoned = frame.with_players(list(frame.players))

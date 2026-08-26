@@ -8,17 +8,21 @@ from __future__ import annotations
 
 import math
 import random
+import warnings
 from pathlib import Path
 
 import pytest
 
 from setpiece._io import read_corners
 from setpiece.suggest import (
+    DEEP_CANDIDATE_DEFENDERS,
     DEFAULT_MAX_EVALS,
+    MAX_CANDIDATE_DEFENDERS,
     Move,
     Suggestion,
     apply_moves,
     candidate_displacements,
+    required_evals,
     suggest,
 )
 from setpiece.types import GOAL_X, GOAL_Y, PITCH_LENGTH, PITCH_WIDTH, CornerFrame, Player
@@ -439,6 +443,384 @@ def test_real_corners() -> None:
             for p in moved.players:
                 assert 0.0 <= p.x <= PITCH_LENGTH
                 assert 0.0 <= p.y <= PITCH_WIDTH
+
+
+# --------------------------------------------------------------------------- #
+# candidate width: how far into the defence the search is allowed to look
+# --------------------------------------------------------------------------- #
+class FurthestDefenderScorer:
+    """Minimised by pulling the defender *furthest* from goal back towards it.
+
+    Deliberately the opposite of what the candidate ranking prefers. The search
+    ranks defenders nearest the goal first, so this scorer's only improving move
+    lives at the far end of that ranking — exactly the region the default
+    ``max_candidates`` of six cannot reach on a ten-defender frame.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, frame: CornerFrame) -> float:
+        self.calls += 1
+        far = max(
+            math.hypot(GOAL_X - p.x, GOAL_Y - p.y)
+            for p in frame.players
+            if not p.is_attacker and not p.is_taker
+        )
+        return 1.0 / (1.0 + math.exp(-(far - 20.0)))
+
+
+def ten_defender_frame() -> CornerFrame:
+    """A taker, two attackers, a keeper and ten outfield defenders in a line.
+
+    The defenders sit 4, 6, ... 22 m from the goal centre, so their distance
+    ranking — the one :func:`setpiece.suggest._movable` sorts by — is exactly
+    their index order and the four furthest are unambiguous.
+    """
+    players = [
+        Player(x=104.6, y=0.4, is_attacker=True, is_taker=True),
+        Player(x=104.5, y=34.0, is_attacker=False, is_keeper=True),
+        Player(x=100.0, y=20.0, is_attacker=True),
+        Player(x=100.0, y=48.0, is_attacker=True),
+    ]
+    players += [Player(x=GOAL_X - r, y=GOAL_Y, is_attacker=False) for r in range(4, 24, 2)]
+    return CornerFrame(corner_id="ten_defenders", players=players)
+
+
+def _outfield_defenders_by_distance(frame: CornerFrame) -> list[int]:
+    idxs = [
+        i
+        for i, p in enumerate(frame.players)
+        if not p.is_attacker and not p.is_taker and not p.is_keeper
+    ]
+    return sorted(idxs, key=lambda i: math.hypot(GOAL_X - frame.players[i].x, GOAL_Y - frame.players[i].y))
+
+
+def test_required_evals_reproduces_the_default_budget() -> None:
+    """288 is the layout's own arithmetic, not a number someone liked."""
+    assert required_evals() == DEFAULT_MAX_EVALS == 288
+    # 6*16 first move, then beam/2 = 4 states over 2 defenders, then beam/4 = 2
+    assert required_evals() == 6 * 16 + 4 * 2 * 16 + 2 * 2 * 16
+    # widening the first level costs exactly the extra defenders
+    assert required_evals(max_candidates=10) == 10 * 16 + 4 * 2 * 16 + 2 * 2 * 16
+    assert required_evals(max_candidates=None, n_movable=10) == required_evals(max_candidates=10)
+    # a frame cannot spend a width it has no defenders for
+    assert required_evals(n_movable=1) == 1 * 16
+    assert required_evals(deep_candidates=0) == 6 * 16
+    assert required_evals(movers=0) == 0
+
+
+@pytest.mark.parametrize(
+    "max_candidates,deep_candidates,movers,beam",
+    [(6, 2, 3, 8), (10, 4, 3, 8), (None, None, 3, 8), (None, None, 4, 4), (3, 1, 2, 8)],
+)
+def test_required_evals_is_an_upper_bound_on_the_real_call_count(
+    max_candidates: int | None, deep_candidates: int | None, movers: int, beam: int
+) -> None:
+    """The budget arithmetic must never under-count, or a search would truncate."""
+    frame = ten_defender_frame()
+    n_movable = len(_outfield_defenders_by_distance(frame))
+    predicted = required_evals(
+        movers=movers,
+        beam=beam,
+        max_candidates=max_candidates,
+        deep_candidates=deep_candidates,
+        n_movable=n_movable,
+    )
+    model = FakeShotModel()
+    suggest(
+        frame,
+        model,
+        movers=movers,
+        beam=beam,
+        max_candidates=max_candidates,
+        deep_candidates=deep_candidates,
+        max_evals=10_000,
+    )
+    assert model.calls - 1 <= predicted, "required_evals under-counted the real search"
+
+
+def test_the_default_width_cannot_reach_the_furthest_defenders() -> None:
+    """The restriction this flag exists to lift, stated as a measurement.
+
+    Ten outfield defenders, and the only improving move belongs to the one
+    furthest from goal. At the default width the search cannot see it and returns
+    nothing better than the base frame; lifting the width finds it.
+    """
+    frame = ten_defender_frame()
+    ranked = _outfield_defenders_by_distance(frame)
+    assert len(ranked) == 10
+    near_six, far_four = set(ranked[:MAX_CANDIDATE_DEFENDERS]), set(ranked[MAX_CANDIDATE_DEFENDERS:])
+    assert len(far_four) == 4
+
+    narrow = suggest(frame, FurthestDefenderScorer(), movers=3, seed=0)
+    assert narrow
+    moved_narrow = {m.player_idx for s in narrow for m in s.moves}
+    assert moved_narrow <= near_six
+    assert not (moved_narrow & far_four), "the default width reached a far defender"
+    assert narrow[0].delta == pytest.approx(0.0, abs=1e-12), (
+        "no move inside the default width can improve this shape"
+    )
+
+    wide = suggest(
+        frame,
+        FurthestDefenderScorer(),
+        movers=3,
+        seed=0,
+        max_candidates=None,
+        deep_candidates=None,
+        max_evals=required_evals(max_candidates=None, deep_candidates=None, n_movable=10),
+    )
+    assert wide
+    moved_wide = {m.player_idx for s in wide for m in s.moves}
+    assert moved_wide & far_four, "a widened search still never reached the far defenders"
+    assert wide[0].delta < narrow[0].delta - 1e-9
+    for sug in wide:
+        check_constraints(frame, sug, movers=3, max_move=3.0, min_sep=0.5)
+
+
+def test_max_candidates_none_puts_every_defender_in_the_first_move_pool() -> None:
+    frame = ten_defender_frame()
+    ranked = _outfield_defenders_by_distance(frame)
+    seen: set[int] = set()
+
+    class Counter:
+        def __call__(self, f: CornerFrame) -> float:
+            moved = [
+                i
+                for i, (a, b) in enumerate(zip(f.players, frame.players, strict=True))
+                if (a.x, a.y) != (b.x, b.y)
+            ]
+            seen.update(moved)
+            return 0.5
+
+    suggest(
+        frame,
+        Counter(),
+        movers=1,
+        seed=0,
+        max_candidates=None,
+        max_evals=required_evals(movers=1, max_candidates=None, n_movable=10),
+    )
+    assert seen == set(ranked), f"pool missed {sorted(set(ranked) - seen)}"
+
+
+@pytest.mark.parametrize("width", [1, 2, 3, 6, 10, None])
+def test_hard_constraints_survive_every_candidate_width(width: int | None) -> None:
+    frame = ten_defender_frame()
+    out = suggest(
+        frame,
+        FakeShotModel(),
+        movers=3,
+        seed=1,
+        max_candidates=width,
+        deep_candidates=width,
+        max_evals=required_evals(
+            max_candidates=width, deep_candidates=width, n_movable=10
+        ),
+    )
+    assert out
+    for sug in out:
+        check_constraints(frame, sug, movers=3, max_move=3.0, min_sep=0.5)
+
+
+def test_zero_candidate_widths_are_coherent() -> None:
+    frame = ten_defender_frame()
+    assert suggest(frame, FakeShotModel(), max_candidates=0) == []
+    only_one = suggest(frame, FakeShotModel(), deep_candidates=0, movers=3)
+    assert only_one
+    assert all(len(s.moves) == 1 for s in only_one), "deep_candidates=0 must stop at one mover"
+
+
+def test_widening_the_search_without_the_budget_warns() -> None:
+    """The trap the flags would otherwise set: a wider search that is not wider."""
+    frame = ten_defender_frame()
+    with pytest.warns(RuntimeWarning, match=r"truncated rather than widened"):
+        suggest(frame, FakeShotModel(), max_candidates=None, max_evals=DEFAULT_MAX_EVALS)
+    with pytest.warns(RuntimeWarning, match=r"needs up to 352 evaluations"):
+        suggest(frame, FakeShotModel(), max_candidates=10, max_evals=DEFAULT_MAX_EVALS)
+
+
+def test_the_default_layout_and_a_deliberately_small_budget_stay_quiet() -> None:
+    """Buying latency back at the default width is supported, not a mistake."""
+    frame = ten_defender_frame()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        suggest(frame, FakeShotModel(), movers=3)
+        suggest(frame, FakeShotModel(), movers=3, max_evals=40)  # what `demo` does
+        suggest(
+            frame,
+            FakeShotModel(),
+            max_candidates=None,
+            deep_candidates=None,
+            max_evals=required_evals(max_candidates=None, deep_candidates=None, n_movable=10),
+        )
+
+
+def test_a_widened_search_is_a_superset_at_the_first_move() -> None:
+    """Widening must not lose a first move the narrow search already had."""
+    for trial in range(4):
+        frame = random_frame(random.Random(700 + trial), n_attackers=6, n_defenders=10)
+        narrow = suggest(frame, FakeShotModel(), movers=1, seed=trial)
+        wide = suggest(
+            frame,
+            FakeShotModel(),
+            movers=1,
+            seed=trial,
+            max_candidates=None,
+            max_evals=required_evals(movers=1, max_candidates=None, n_movable=10),
+        )
+        assert wide
+        assert wide[0].delta <= narrow[0].delta + 1e-12
+
+
+def test_widening_is_still_deterministic() -> None:
+    frame = ten_defender_frame()
+    kwargs = {
+        "max_candidates": None,
+        "deep_candidates": None,
+        "max_evals": required_evals(max_candidates=None, deep_candidates=None, n_movable=10),
+        "seed": 5,
+    }
+    first = suggest(frame, FakeShotModel(), **kwargs)
+    second = suggest(frame, FakeShotModel(), **kwargs)
+    assert first == second
+    assert [(m.player_idx, m.dx.hex(), m.dy.hex()) for s in first for m in s.moves] == [
+        (m.player_idx, m.dx.hex(), m.dy.hex()) for s in second for m in s.moves
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# the CLI surface of the same three knobs
+# --------------------------------------------------------------------------- #
+def test_cli_exposes_the_search_width_flags() -> None:
+    from setpiece import cli
+
+    args = cli.build_parser().parse_args(["suggest", "c.json"])
+    assert args.max_candidates == MAX_CANDIDATE_DEFENDERS
+    assert args.deep_candidates == DEEP_CANDIDATE_DEFENDERS
+    assert args.move_keeper is False
+    assert args.max_evals is None  # sized from the layout, not fixed
+
+    wide = cli.build_parser().parse_args(
+        [
+            "suggest",
+            "c.json",
+            "--max-candidates",
+            "all",
+            "--deep-candidates",
+            "4",
+            "--move-keeper",
+            "--max-evals",
+            "900",
+        ]
+    )
+    assert wide.max_candidates is None
+    assert wide.deep_candidates == 4
+    assert wide.move_keeper is True
+    assert wide.max_evals == 900
+
+
+@pytest.mark.parametrize("bad", ["-1", "banana", "3.5"])
+def test_cli_rejects_a_nonsense_candidate_width(bad: str) -> None:
+    from setpiece import cli
+
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["suggest", "c.json", "--max-candidates", bad])
+
+
+def test_cli_sizes_the_budget_from_the_layout() -> None:
+    """``--max-candidates all`` must widen the search, not truncate it."""
+    from setpiece import cli
+
+    frame = ten_defender_frame()
+    default = cli.suggest_frame(
+        frame, FakeShotModel(), movers=3, max_move=3.0, seed=0, defend=True, beam=8, top_k=8
+    )
+    assert default["params"]["max_evals"] == DEFAULT_MAX_EVALS
+    assert default["params"]["max_candidates"] == MAX_CANDIDATE_DEFENDERS
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # a sized budget must not trip the truncation warning
+        wide = cli.suggest_frame(
+            frame,
+            FurthestDefenderScorer(),
+            movers=3,
+            max_move=3.0,
+            seed=0,
+            defend=True,
+            beam=8,
+            top_k=8,
+            max_candidates=None,
+            deep_candidates=None,
+        )
+    assert wide["params"]["max_evals"] == required_evals(
+        max_candidates=None, deep_candidates=None, n_movable=10
+    )
+    far_four = set(_outfield_defenders_by_distance(frame)[MAX_CANDIDATE_DEFENDERS:])
+    moved = {m["player_idx"] for s in wide["suggestions"] for m in s["moves"]}
+    assert moved & far_four
+
+
+def test_cli_move_keeper_reaches_the_keeper() -> None:
+    from setpiece import cli
+
+    frame = ten_defender_frame()
+    keeper_idx = next(i for i, p in enumerate(frame.players) if p.is_keeper)
+    plain = cli.suggest_frame(
+        frame, FakeShotModel(), movers=3, max_move=3.0, seed=0, defend=True, beam=8, top_k=8
+    )
+    assert all(
+        m["player_idx"] != keeper_idx for s in plain["suggestions"] for m in s["moves"]
+    )
+
+    with_keeper = cli.suggest_frame(
+        frame,
+        FakeShotModel(),
+        movers=1,
+        max_move=3.0,
+        seed=0,
+        defend=True,
+        beam=8,
+        top_k=500,  # every scored single move, so "in the pool" is what is tested
+        move_keeper=True,
+        max_candidates=None,
+    )
+    assert with_keeper["params"]["move_keeper"] is True
+    moved = {m["player_idx"] for s in with_keeper["suggestions"] for m in s["moves"]}
+    assert keeper_idx in moved
+
+
+def test_pretty_output_states_the_search_width() -> None:
+    """The bound used to be invisible; now every suggestion carries it."""
+    from setpiece import cli
+
+    frame = ten_defender_frame()
+    result = cli.suggest_frame(
+        frame, FakeShotModel(), movers=3, max_move=3.0, seed=0, defend=True, beam=8, top_k=3
+    )
+    text = cli.format_suggestions([result], "pretty")
+    assert "search width: 6 defenders for the first move, 2 for later moves" in text
+    assert "keeper excluded" in text
+    assert f"budget {DEFAULT_MAX_EVALS} evaluations" in text
+    assert "--max-candidates" in text
+
+    wide = cli.suggest_frame(
+        frame,
+        FakeShotModel(),
+        movers=3,
+        max_move=3.0,
+        seed=0,
+        defend=True,
+        beam=8,
+        top_k=3,
+        max_candidates=None,
+        deep_candidates=None,
+        move_keeper=True,
+    )
+    wide_text = cli.format_suggestions([wide], "pretty")
+    assert "all defenders for the first move, all for later moves" in wide_text
+    assert "keeper movable" in wide_text
 
 
 def _tight_pairs(frame: CornerFrame, min_sep: float) -> set[tuple[int, int]]:

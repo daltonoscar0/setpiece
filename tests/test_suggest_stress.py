@@ -38,7 +38,14 @@ from pathlib import Path
 import pytest
 
 from setpiece._io import read_corners
-from setpiece.suggest import Move, Suggestion, apply_moves, candidate_displacements, suggest
+from setpiece.suggest import (
+    Move,
+    Suggestion,
+    apply_moves,
+    candidate_displacements,
+    required_evals,
+    suggest,
+)
 from setpiece.types import PITCH_LENGTH, PITCH_WIDTH, CornerFrame, Player
 
 REPO = Path(__file__).resolve().parents[1]
@@ -320,6 +327,140 @@ def test_hard_constraints_hold_across_every_hostile_frame(
         )
 
 
+# --------------------------------------------------------------------------- #
+# the same sweep, with the candidate restriction lifted
+# --------------------------------------------------------------------------- #
+def n_movable(frame: CornerFrame, move_keeper: bool = False) -> int:
+    """How many defenders the search is allowed to consider on this frame."""
+    return sum(
+        1
+        for p in frame.players
+        if not p.is_attacker and not p.is_taker and (move_keeper or not p.is_keeper)
+    )
+
+
+def wide_budget(
+    frame: CornerFrame, movers: int, beam: int, deep: int | None, move_keeper: bool = False
+) -> int:
+    """A budget that cannot bind, so the widened search really is widened."""
+    return max(
+        1,
+        required_evals(
+            movers=movers,
+            beam=beam,
+            max_candidates=None,
+            deep_candidates=deep,
+            n_movable=n_movable(frame, move_keeper),
+        ),
+    )
+
+
+#: (movers, max_move, min_sep, beam, seed, deep_candidates) for the widened
+#: sweep. ``max_candidates`` is always ``None`` here — every defender on the
+#: frame is a candidate for the first move, which is the setting the default of
+#: six exists to avoid paying for.
+WIDE_SETTINGS = (
+    (3, 3.0, 0.5, 8, 0, None),
+    (3, 3.0, 0.5, 8, 17, 4),
+    (2, 6.0, 2.0, 4, 0, None),
+)
+
+
+@pytest.mark.parametrize("movers,max_move,min_sep,beam,seed,deep", WIDE_SETTINGS)
+def test_hard_constraints_hold_with_the_candidate_restriction_lifted(
+    movers: int, max_move: float, min_sep: float, beam: int, seed: int, deep: int | None
+) -> None:
+    """Every guarantee has to survive a search that is an order of magnitude wider.
+
+    A wider pool means more chances to place a defender on top of someone, off
+    the touchline, or twice; none of the constraints are enforced by the
+    branching bound, and this is what proves it.
+    """
+    for name in FRAME_NAMES:
+        frame = ALL_FRAMES[name]
+        out = suggest(
+            frame,
+            analytic_scorer,
+            movers=movers,
+            max_move=max_move,
+            min_sep=min_sep,
+            beam=beam,
+            seed=seed,
+            max_candidates=None,
+            deep_candidates=deep,
+            max_evals=wide_budget(frame, movers, beam, deep),
+        )
+        assert_constraints(
+            frame,
+            out,
+            movers=movers,
+            max_move=max_move,
+            min_sep=min_sep,
+            tag=f"{name} wide seed={seed} movers={movers} deep={deep}",
+        )
+
+
+def test_widening_never_loses_a_single_move_the_narrow_search_found() -> None:
+    """At one mover the wide pool is a strict superset, so it cannot do worse.
+
+    Run over the whole sweep because the interesting cases are the hostile ones:
+    a frame where most of the pool is inadmissible is exactly where a truncated
+    budget would quietly hand back the narrow answer.
+    """
+    for name in FRAME_NAMES:
+        frame = ALL_FRAMES[name]
+        narrow = suggest(frame, analytic_scorer, movers=1, seed=0)
+        wide = suggest(
+            frame,
+            analytic_scorer,
+            movers=1,
+            seed=0,
+            max_candidates=None,
+            max_evals=wide_budget(frame, 1, 8, None),
+        )
+        if not narrow:
+            continue
+        assert wide, f"{name}: narrow found a move and wide found none"
+        assert wide[0].delta <= narrow[0].delta + 1e-12, name
+
+
+def test_a_widened_search_that_outruns_its_budget_warns_rather_than_lying() -> None:
+    frame = ALL_FRAMES["goal_line"]
+    assert n_movable(frame) >= 8, "fixture needs more defenders than the default width"
+    with pytest.warns(RuntimeWarning, match=r"truncated rather than widened"):
+        out = suggest(frame, analytic_scorer, max_candidates=None, max_evals=288)
+    # and the truncated search is still a legal one
+    assert_constraints(frame, out, movers=3, max_move=3.0, min_sep=0.5, tag="goal_line truncated")
+
+
+def test_the_keeper_joins_the_pool_only_when_asked_across_the_sweep() -> None:
+    for name in FRAME_NAMES:
+        frame = ALL_FRAMES[name]
+        keepers = {i for i, p in enumerate(frame.players) if p.is_keeper and not p.is_attacker}
+        if not keepers:
+            continue
+        default = suggest(
+            frame,
+            analytic_scorer,
+            seed=0,
+            max_candidates=None,
+            max_evals=wide_budget(frame, 3, 8, 2),
+        )
+        assert not {m.player_idx for s in default for m in s.moves} & keepers, name
+
+        out = suggest(
+            frame,
+            analytic_scorer,
+            seed=0,
+            move_keeper=True,
+            max_candidates=None,
+            max_evals=wide_budget(frame, 3, 8, 2, move_keeper=True),
+        )
+        assert_constraints(
+            frame, out, movers=3, max_move=3.0, min_sep=0.5, tag=f"{name} move_keeper"
+        )
+
+
 def test_frames_without_a_movable_defender_yield_nothing() -> None:
     for name in ("zero_defenders", "keeper_only"):
         assert suggest(ALL_FRAMES[name], analytic_scorer, seed=0) == []
@@ -443,8 +584,23 @@ DETERMINISM_FRAMES = sorted(degenerate_frames()) + FRAME_NAMES[::10]
 def _sweep_fingerprint() -> str:
     parts = []
     for name in DETERMINISM_FRAMES:
+        frame = ALL_FRAMES[name]
         for seed in (0, 5):
-            parts.append(_fingerprint(suggest(ALL_FRAMES[name], analytic_scorer, seed=seed)))
+            parts.append(_fingerprint(suggest(frame, analytic_scorer, seed=seed)))
+        # the widened search enumerates a longer, less pruned pool, so it has
+        # more room for an ordering wobble than the default one does
+        parts.append(
+            _fingerprint(
+                suggest(
+                    frame,
+                    analytic_scorer,
+                    seed=0,
+                    max_candidates=None,
+                    deep_candidates=None,
+                    max_evals=wide_budget(frame, 3, 8, None),
+                )
+            )
+        )
     return json.dumps(parts)
 
 

@@ -88,9 +88,15 @@ def make_data(n_nodes: int, n_candidates: int, *, seed: int = 0) -> Data:
     )
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def graphs() -> list[Data]:
-    """Three graphs of deliberately different sizes and candidate counts."""
+    """Three graphs of deliberately different sizes and candidate counts.
+
+    Module scoped: ``make_data`` is seeded and every consumer below only reads
+    the graphs (batching and ``forward`` both allocate fresh tensors rather than
+    writing back), so rebuilding 844 edges of random features per test was pure
+    overhead. Tests that mutate a graph build their own with ``make_data``.
+    """
     return [
         make_data(11, 4, seed=1),
         make_data(17, 7, seed=2),
@@ -112,7 +118,9 @@ def shot_model(**kw: Any) -> ShotModel:
     return model
 
 
+@pytest.fixture(scope="module")
 def real_corners() -> list:
+    """The smoke corners, read from disk once instead of once per test."""
     if not SMOKE.exists():
         pytest.skip(f"no smoke dataset at {SMOKE}")
     corners = read_corners(SMOKE)
@@ -414,8 +422,8 @@ def test_load_bundled_rejects_unknown_names() -> None:
 # single-corner inference on real data
 # --------------------------------------------------------------------------- #
 @needs_features
-def test_receiver_probabilities_form_a_distribution() -> None:
-    corners = real_corners()
+def test_receiver_probabilities_form_a_distribution(real_corners: list) -> None:
+    corners = real_corners
     torch.manual_seed(0)
     model = ReceiverModel()
     model.eval()
@@ -438,8 +446,8 @@ def test_receiver_probabilities_form_a_distribution() -> None:
 
 
 @needs_features
-def test_shot_probability_is_a_probability() -> None:
-    corners = real_corners()
+def test_shot_probability_is_a_probability(real_corners: list) -> None:
+    corners = real_corners
     torch.manual_seed(0)
     model = ShotModel()
     model.eval()
@@ -450,9 +458,17 @@ def test_shot_probability_is_a_probability() -> None:
         assert math.isfinite(p)
 
 
+@pytest.mark.slow
 @needs_features
-def test_inference_is_under_100ms_per_corner() -> None:
-    corners = real_corners()
+def test_inference_is_under_100ms_per_corner(real_corners: list) -> None:
+    """The contract's 100 ms per-corner inference budget.
+
+    Marked slow because it is a wall-clock benchmark: it scores 23 corners of
+    otherwise redundant work, and its verdict only means anything on an unloaded
+    machine. The correctness of the same code path is covered by the two
+    probability tests above, which stay in the fast subset.
+    """
+    corners = real_corners
     frame = corners[0]
     torch.manual_seed(0)
     receiver = ReceiverModel()
@@ -476,9 +492,9 @@ def test_inference_is_under_100ms_per_corner() -> None:
 
 
 @needs_features
-def test_real_corners_batch_into_per_graph_distributions() -> None:
+def test_real_corners_batch_into_per_graph_distributions(real_corners: list) -> None:
     """End-to-end: real frames of differing sizes, batched, still normalise per graph."""
-    corners = real_corners()
+    corners = real_corners
     frames = corners[:6]
     sizes = {len(f.players) for f in frames}
     assert len(sizes) > 1, "expected variable-size freeze frames in the smoke set"
@@ -508,9 +524,9 @@ def test_real_corners_batch_into_per_graph_distributions() -> None:
 
 
 @needs_features
-def test_probabilities_respond_to_moving_a_player() -> None:
+def test_probabilities_respond_to_moving_a_player(real_corners: list) -> None:
     """Sanity check that the featuriser and the model are actually coupled."""
-    corners = real_corners()
+    corners = real_corners
     frame = corners[0]
     torch.manual_seed(0)
     model = ShotModel()

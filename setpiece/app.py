@@ -73,6 +73,7 @@ __all__ = [
     "model_arg_from_argv",
     "move_arrows",
     "object_centre_px",
+    "pin_torch_threads",
     "pitch_markings",
     "pitch_to_canvas",
     "player_label",
@@ -491,6 +492,30 @@ class ModelBundle:
     @property
     def ready(self) -> bool:
         return self.receiver is not None and self.shot is not None
+
+
+def pin_torch_threads() -> int:
+    """Score single threaded unless the user asked for something else.
+
+    ``setpiece app`` launches this module as a fresh ``streamlit run``
+    subprocess, so ``_tune_torch_threads`` in :mod:`setpiece.cli` never reaches
+    it — the child inherits the parent's environment and none of its in-process
+    torch settings. A corner graph has twenty-odd nodes; spreading that over the
+    machine's cores costs more in synchronisation than it saves, and the
+    suggestion search pays that cost hundreds of times over.
+
+    An ``OMP_NUM_THREADS`` or ``MKL_NUM_THREADS`` the user set explicitly wins:
+    torch has already read it at import time and somebody who set it meant it.
+    Returns the number of threads torch will actually use, so a caller can see
+    which of the two happened.
+    """
+    import os
+
+    import torch
+
+    if not any(os.environ.get(k) for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS")):
+        torch.set_num_threads(1)
+    return torch.get_num_threads()
 
 
 def model_arg_from_argv(argv: list[str] | None = None) -> str | None:
@@ -1041,6 +1066,9 @@ def load_uploaded_corner(name: str, data: bytes) -> CornerFrame:
 # --------------------------------------------------------------------------- #
 @st.cache_resource(show_spinner=False)
 def _cached_bundle(receiver_path: str | None, shot_path: str | None) -> ModelBundle:
+    # ``main`` pins first on every rerun, but this is the one place that touches
+    # torch weights, and a cached resource outlives whichever run created it.
+    pin_torch_threads()
     return load_bundle(receiver_path, shot_path)
 
 
@@ -1179,7 +1207,14 @@ def _reset(frame: CornerFrame) -> None:
 
 
 def main() -> None:
-    """Entry point. Launched by ``setpiece app`` via ``streamlit run``."""
+    """Entry point. Launched by ``setpiece app`` via ``streamlit run``.
+
+    Streamlit re-executes this module top to bottom on every interaction, so the
+    thread pin is re-applied here rather than at import: it is idempotent and
+    costs nothing, and it has to happen before anything in the rerun scores a
+    frame or runs the search.
+    """
+    pin_torch_threads()
     st.set_page_config(page_title="setpiece pitch editor", layout="wide")
     st.title("setpiece - corner pitch editor")
     st.caption(STATIC_NOTE)

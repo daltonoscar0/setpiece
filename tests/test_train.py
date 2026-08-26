@@ -466,7 +466,18 @@ def test_metrics_are_in_range(tmp_path: Path) -> None:
                 assert math.isnan(value) or 0.0 <= value <= 1.0, f"{family}/{name}/{key}={value}"
 
 
+@pytest.mark.slow
 def test_training_is_reproducible(tmp_path: Path) -> None:
+    """Two identical runs must agree.
+
+    Marked slow because it is the only test that runs ``train_all`` twice over
+    the same rows purely to compare the results, so the second cross-validation
+    is duplicated work by construction. It is also the test most sensitive to
+    machine state: per ``TODO.md`` the GNN is only bit-reproducible at a fixed
+    torch thread count, so it belongs in the deliberate run rather than in the
+    edit loop. ``test_train_all_end_to_end`` keeps the pipeline itself covered
+    in the fast subset.
+    """
     path = make_dataset(tmp_path / "d.jsonl", matches=4, per_match=3)
     kwargs = dict(
         folds=2, epochs=2, hidden=8, layers=2, batch_size=8, baseline_iters=10,

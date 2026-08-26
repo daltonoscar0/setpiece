@@ -2,6 +2,8 @@
 
     setpiece score   <corner> [--format json|csv|pretty] [--model PATH]
     setpiece suggest <corner> [--defend] [--movers 3] [--max-move 3.0] [--seed 0]
+                              [--max-candidates 6] [--deep-candidates 2]
+                              [--move-keeper] [--max-evals N]
     setpiece demo
     setpiece app
     setpiece fetch   [--competition NAME] [--max-matches N]
@@ -47,6 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from setpiece import __version__
+from setpiece.suggest import DEEP_CANDIDATE_DEFENDERS, MAX_CANDIDATE_DEFENDERS
 from setpiece.types import CornerFrame
 
 __all__ = [
@@ -452,21 +455,52 @@ def suggest_frame(
     beam: int,
     top_k: int,
     max_evals: int | None = None,
+    max_candidates: int | None = MAX_CANDIDATE_DEFENDERS,
+    deep_candidates: int | None = DEEP_CANDIDATE_DEFENDERS,
+    move_keeper: bool = False,
 ) -> dict:
-    """Run the adjustment search and flatten the suggestions into a dict."""
+    """Run the adjustment search and flatten the suggestions into a dict.
+
+    ``max_evals=None`` means "whatever this layout can actually spend", sized by
+    :func:`setpiece.suggest.required_evals`. That is what makes ``--movers`` and
+    ``--max-candidates`` widen the search rather than truncate it: the search
+    budget is a property of the branching the user asked for, not a constant that
+    happens to fit the defaults. At the default flags it computes 288, the same
+    number the library defaults to, so nothing changes unless a flag does.
+    """
     from setpiece import suggest as suggest_mod
 
-    kwargs: dict[str, Any] = {
-        "movers": movers,
-        "max_move": max_move,
-        "seed": seed,
-        "defend": defend,
-        "beam": beam,
-        "top_k": top_k,
-    }
-    if max_evals is not None:
-        kwargs["max_evals"] = max_evals
-    suggestions = suggest_mod.suggest(frame, shot_model, **kwargs)
+    if max_evals is None:
+        # clamped to 1 so a frame with no movable defender still reports a
+        # budget rather than a zero that reads as "the search was switched off"
+        max_evals = max(
+            1,
+            suggest_mod.required_evals(
+                movers=movers,
+                beam=beam,
+                max_candidates=max_candidates,
+                deep_candidates=deep_candidates,
+                n_movable=sum(
+                    1
+                    for p in frame.players
+                    if not p.is_attacker and not p.is_taker and (move_keeper or not p.is_keeper)
+                ),
+            ),
+        )
+    suggestions = suggest_mod.suggest(
+        frame,
+        shot_model,
+        movers=movers,
+        max_move=max_move,
+        seed=seed,
+        defend=defend,
+        beam=beam,
+        top_k=top_k,
+        max_evals=max_evals,
+        max_candidates=max_candidates,
+        deep_candidates=deep_candidates,
+        move_keeper=move_keeper,
+    )
 
     out: list[dict] = []
     for rank, s in enumerate(suggestions, 1):
@@ -507,6 +541,10 @@ def suggest_frame(
             "seed": seed,
             "beam": beam,
             "top_k": top_k,
+            "max_candidates": max_candidates,
+            "deep_candidates": deep_candidates,
+            "move_keeper": move_keeper,
+            "max_evals": max_evals,
         },
         "base_p_shot": base,
         "suggestions": out,
@@ -521,6 +559,28 @@ def _moves_text(moves: Sequence[dict]) -> str:
     )
 
 
+def _search_width_line(params: dict) -> str:
+    """One line naming the search restriction, so it is never silent.
+
+    The candidate widths are the reason a defender out by the penalty spot may
+    never be considered however good a move it would be. Printing them next to
+    every suggestion means the user can see the bound and the flag that lifts it.
+    """
+
+    def width(value: Any) -> str:
+        return "all" if value is None else str(value)
+
+    keeper = "keeper movable" if params.get("move_keeper") else "keeper excluded"
+    return (
+        f"search width: {width(params.get('max_candidates', MAX_CANDIDATE_DEFENDERS))} "
+        f"defenders for the first move, "
+        f"{width(params.get('deep_candidates', DEEP_CANDIDATE_DEFENDERS))} for later moves, "
+        f"nearest the goal first; {keeper}; "
+        f"budget {params.get('max_evals', '?')} evaluations "
+        f"(--max-candidates / --deep-candidates / --move-keeper / --max-evals)"
+    )
+
+
 def _pretty_suggestion(result: dict) -> str:
     head = f"corner {_short_id(result['corner_id'])}"
     where = _describe_result(result)
@@ -531,7 +591,9 @@ def _pretty_suggestion(result: dict) -> str:
         if result["objective"] == "minimise_shot"
         else "raise the shot probability"
     )
-    lines = [head, f"moving up to {result['params']['movers']} defenders to {goal}"]
+    params = result.get("params", {})
+    lines = [head, f"moving up to {params.get('movers')} defenders to {goal}"]
+    lines.append(_search_width_line(params))
     if result["base_p_shot"] is None:
         lines.append("")
         lines.append("no admissible adjustment found for this shape")
@@ -635,6 +697,10 @@ def _cmd_suggest(args: argparse.Namespace, out: Any) -> int:
             defend=not args.attack,
             beam=args.beam,
             top_k=args.top_k if args.top_k is not None else args.beam,
+            max_evals=args.max_evals,
+            max_candidates=args.max_candidates,
+            deep_candidates=args.deep_candidates,
+            move_keeper=args.move_keeper,
         )
         for f in frames
     ]
@@ -801,6 +867,21 @@ def run_train(extra: Sequence[str]) -> int:
 # --------------------------------------------------------------------------- #
 # parser
 # --------------------------------------------------------------------------- #
+def _candidate_width(value: str) -> int | None:
+    """Parse a candidate width: a non-negative integer, or ``all`` for no bound."""
+    if value.strip().lower() in ("all", "none"):
+        return None
+    try:
+        width = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected a non-negative integer or 'all', got {value!r}"
+        ) from None
+    if width < 0:
+        raise argparse.ArgumentTypeError(f"a candidate width cannot be negative: {width}")
+    return width
+
+
 def _add_model_flag(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--model",
@@ -867,6 +948,47 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         dest="top_k",
         help="suggestions returned (default: the beam width)",
+    )
+    p_suggest.add_argument(
+        "--max-candidates",
+        type=_candidate_width,
+        default=MAX_CANDIDATE_DEFENDERS,
+        dest="max_candidates",
+        metavar="N|all",
+        help=(
+            f"defenders, nearest the attacked goal first, tried for the first move "
+            f"(default: {MAX_CANDIDATE_DEFENDERS}; 'all' considers every defender). "
+            f"The search budget grows to match unless --max-evals says otherwise."
+        ),
+    )
+    p_suggest.add_argument(
+        "--deep-candidates",
+        type=_candidate_width,
+        default=DEEP_CANDIDATE_DEFENDERS,
+        dest="deep_candidates",
+        metavar="N|all",
+        help=(
+            f"the same, for the second and later moves "
+            f"(default: {DEEP_CANDIDATE_DEFENDERS}; 'all' considers every defender)"
+        ),
+    )
+    p_suggest.add_argument(
+        "--move-keeper",
+        action="store_true",
+        dest="move_keeper",
+        help="let the goalkeeper be repositioned too (excluded by default)",
+    )
+    p_suggest.add_argument(
+        "--max-evals",
+        type=int,
+        default=None,
+        dest="max_evals",
+        metavar="N",
+        help=(
+            "ceiling on shot-model evaluations. Defaults to exactly what the "
+            "chosen movers/beam/candidate widths can spend, which is 288 at the "
+            "default flags; lower it to buy latency back."
+        ),
     )
     _add_format_flag(p_suggest)
     _add_model_flag(p_suggest)

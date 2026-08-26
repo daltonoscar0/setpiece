@@ -34,15 +34,30 @@ by half at each level. For the default ``movers=3`` and ``beam=8`` that is
 
 evaluations, which at the ~3 ms an untrained ``ShotModel`` costs per corner on
 one CPU thread is a little under a second — the round trip the pitch editor
-allows. Wider settings overrun the budget, and the search then degrades to an
-anytime one: expansions are enumerated in beam rank order, best states first,
-and stop when the budget runs out.
+allows. :func:`required_evals` computes that sum for any layout, and 288 is
+exactly ``required_evals()`` at the defaults.
+
+Widening the search and the budget are two separate knobs, and they interact:
+``max_candidates=None`` on a frame with ten movable defenders wants
+``10*16 + 4*2*16 + 2*2*16 = 352`` evaluations, so leaving ``max_evals`` at 288
+truncates the search rather than widening it. The search degrades gracefully —
+expansions are enumerated in beam rank order, best states first, and stop when
+the budget runs out — but the caller asked for a wider search and did not get
+one. :func:`suggest` therefore warns whenever the branching was widened past
+:data:`MAX_CANDIDATE_DEFENDERS` / :data:`DEEP_CANDIDATE_DEFENDERS` and the
+budget cannot cover it, naming the number of evaluations needed. A deliberately
+small ``max_evals`` at the default branching is a supported, quiet use — that is
+what ``setpiece demo`` does — so it is not warned about. ``setpiece suggest``
+sizes ``max_evals`` from the layout with :func:`required_evals` unless
+``--max-evals`` says otherwise, so widening the flags there really does widen
+the search.
 """
 
 from __future__ import annotations
 
 import math
 import random
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -58,8 +73,10 @@ N_DIRECTIONS: int = 8
 #: Radii of the candidate rings, as fractions of ``max_move``.
 RADIUS_FRACTIONS: tuple[float, ...] = (1.0, 0.5)
 
-#: Defenders considered when expanding the base frame, ranked by how close they
-#: already are to the goal being attacked. Bounds the branching factor.
+#: Default number of defenders considered when expanding the base frame, ranked
+#: by how close they already are to the goal being attacked. Bounds the
+#: branching factor; lift it with ``suggest(..., max_candidates=...)`` or
+#: ``setpiece suggest --max-candidates``.
 MAX_CANDIDATE_DEFENDERS: int = 6
 
 #: The same, for expansions below the first move. Deeper levels are narrower
@@ -67,6 +84,7 @@ MAX_CANDIDATE_DEFENDERS: int = 6
 DEEP_CANDIDATE_DEFENDERS: int = 2
 
 #: Default ceiling on shot-model evaluations for one :func:`suggest` call.
+#: Equal to ``required_evals()`` at the default layout.
 DEFAULT_MAX_EVALS: int = 288
 
 
@@ -223,6 +241,58 @@ def _beam_width(beam: int, depth: int) -> int:
     return max(1, beam >> (depth + 1))
 
 
+#: Stand-in width for ``max_candidates=None`` when the frame is not to hand. A
+#: freeze frame holds at most 22 players, so no side can field more than this
+#: many movable outfield defenders.
+_UNBOUNDED_CANDIDATES: int = 10
+
+
+def required_evals(
+    *,
+    movers: int = 3,
+    beam: int = 8,
+    max_candidates: int | None = MAX_CANDIDATE_DEFENDERS,
+    deep_candidates: int | None = DEEP_CANDIDATE_DEFENDERS,
+    n_displacements: int | None = None,
+    n_movable: int | None = None,
+) -> int:
+    """Evaluations :func:`suggest` would spend at this layout if nothing were pruned.
+
+    This is the exact arithmetic the search loop performs, not an estimate: one
+    root state expanded over ``max_candidates`` defenders, then
+    ``_beam_width(beam, depth-1)`` states expanded over ``deep_candidates``
+    defenders at every level below, each expansion trying every candidate
+    displacement. It is an *upper* bound on the real count, because a
+    displacement that leaves the pitch, breaches ``min_sep`` or repeats a state
+    already scored is skipped without costing an evaluation.
+
+    ``required_evals()`` with no arguments is :data:`DEFAULT_MAX_EVALS`, which is
+    how that constant was derived. Pass ``n_movable`` to tighten the bound for a
+    specific frame: a frame with four movable defenders cannot spend a candidate
+    width of ten.
+
+    A ``None`` candidate width means "every movable defender", which is only a
+    finite number when ``n_movable`` is given; without it, the width falls back
+    to the number of defenders a full freeze frame could plausibly carry
+    (:data:`_UNBOUNDED_CANDIDATES`), so the answer stays finite and generous.
+    """
+    if n_displacements is None:
+        n_displacements = N_DIRECTIONS * len(RADIUS_FRACTIONS)
+    depth = movers if n_movable is None else min(movers, n_movable)
+    total = 0
+    for d in range(max(0, depth)):
+        width = max_candidates if d == 0 else deep_candidates
+        if width is None:
+            width = n_movable if n_movable is not None else _UNBOUNDED_CANDIDATES
+        if n_movable is not None:
+            width = min(width, n_movable - d)
+        if width <= 0:
+            break
+        states = 1 if d == 0 else max(1, beam >> d)
+        total += states * width * n_displacements
+    return total
+
+
 def _movable(frame: CornerFrame, move_keeper: bool) -> list[int]:
     """Defender indices, ranked by distance to the goal being attacked.
 
@@ -244,6 +314,52 @@ def _movable(frame: CornerFrame, move_keeper: bool) -> list[int]:
     return idxs
 
 
+def _warn_if_budget_truncates_a_widened_search(
+    *,
+    movers: int,
+    beam: int,
+    max_candidates: int | None,
+    deep_candidates: int | None,
+    n_displacements: int,
+    n_movable: int,
+    max_evals: int,
+) -> None:
+    """Say so when a caller widened the branching but left the budget behind.
+
+    Only fires for a *widened* search. Shrinking ``max_evals`` at the default
+    branching is a deliberate latency trade — ``setpiece demo`` does exactly
+    that — and warning about it would train people to ignore the warning.
+    """
+    widened = (
+        max_candidates is None
+        or max_candidates > MAX_CANDIDATE_DEFENDERS
+        or deep_candidates is None
+        or deep_candidates > DEEP_CANDIDATE_DEFENDERS
+    )
+    if not widened:
+        return
+    need = required_evals(
+        movers=movers,
+        beam=beam,
+        max_candidates=max_candidates,
+        deep_candidates=deep_candidates,
+        n_displacements=n_displacements,
+        n_movable=n_movable,
+    )
+    if need <= max_evals:
+        return
+    warnings.warn(
+        f"max_evals={max_evals} cannot cover max_candidates="
+        f"{'all' if max_candidates is None else max_candidates}, deep_candidates="
+        f"{'all' if deep_candidates is None else deep_candidates} on a frame with "
+        f"{n_movable} movable defenders: that layout needs up to {need} evaluations, "
+        f"so the search will be truncated rather than widened. Pass "
+        f"max_evals=required_evals(...) to spend the wider branching.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # public entry point
 # --------------------------------------------------------------------------- #
@@ -260,6 +376,8 @@ def suggest(
     max_evals: int = DEFAULT_MAX_EVALS,
     move_keeper: bool = False,
     top_k: int | None = None,
+    max_candidates: int | None = MAX_CANDIDATE_DEFENDERS,
+    deep_candidates: int | None = DEEP_CANDIDATE_DEFENDERS,
 ) -> list[Suggestion]:
     """Search for defender repositionings that move the modelled shot probability.
 
@@ -277,16 +395,34 @@ def suggest(
         defend: ``True`` minimises the shot probability, ``False`` maximises it
             (useful for showing an attacking coach where the shape breaks).
         max_evals: ceiling on shot-model evaluations, excluding the base frame.
+            It does not grow with ``max_candidates``; see the note below.
         move_keeper: allow the goalkeeper to be repositioned.
         top_k: how many suggestions to return. Defaults to ``beam``.
+        max_candidates: how many defenders, nearest the attacked goal first, are
+            tried for the *first* move. ``None`` means every movable defender;
+            ``0`` means none, so no suggestion exists.
+        deep_candidates: the same for every move below the first, where the beam
+            is already carrying the promising openings. ``0`` restricts the
+            search to single-defender adjustments.
 
     Returns:
         Suggestions ranked best first: by ``delta`` ascending when ``defend`` is
         True, descending when it is False. Every returned suggestion has at least
         one move, and every move has non-zero length. An empty list means no
         admissible move exists — a frame with no movable defender, ``movers <= 0``,
-        a ``max_move`` that is not positive and finite, or a shape so tight that
-        every candidate displacement breaches ``min_sep`` or the touchline.
+        ``max_candidates == 0``, a ``max_move`` that is not positive and finite,
+        or a shape so tight that every candidate displacement breaches
+        ``min_sep`` or the touchline.
+
+    Budget and branching: ``max_evals`` is an independent ceiling, so widening
+    ``max_candidates`` or ``deep_candidates`` without raising it truncates the
+    search instead of widening it — the extra defenders are enumerated but the
+    counter runs out before they are reached. Size the budget with
+    :func:`required_evals`, which returns exactly what a layout can spend. When
+    the branching is widened past :data:`MAX_CANDIDATE_DEFENDERS` /
+    :data:`DEEP_CANDIDATE_DEFENDERS` and ``max_evals`` cannot cover it, a
+    ``RuntimeWarning`` says so and names the figure; a small ``max_evals`` at the
+    default branching is a supported, quiet way to buy latency back.
 
     Pre-existing overlaps: if two players are already closer than ``min_sep`` in
     ``frame``, the search will not repair the pair unless it happens to move one
@@ -300,6 +436,8 @@ def suggest(
     limit = beam if top_k is None else top_k
     if limit <= 0 or movers <= 0 or beam <= 0 or max_evals <= 0:
         return []
+    if max_candidates is not None and max_candidates <= 0:
+        return []
     if not math.isfinite(max_move) or max_move <= 0.0:
         return []
 
@@ -308,6 +446,15 @@ def suggest(
         return []
 
     displacements = candidate_displacements(max_move, seed)
+    _warn_if_budget_truncates_a_widened_search(
+        movers=movers,
+        beam=beam,
+        max_candidates=max_candidates,
+        deep_candidates=deep_candidates,
+        n_displacements=len(displacements),
+        n_movable=len(movable),
+        max_evals=max_evals,
+    )
     sign = 1.0 if defend else -1.0
 
     root = _State(
@@ -322,13 +469,16 @@ def suggest(
     evals = 0
 
     for depth in range(min(movers, len(movable))):
-        width = MAX_CANDIDATE_DEFENDERS if depth == 0 else DEEP_CANDIDATE_DEFENDERS
+        width = max_candidates if depth == 0 else deep_candidates
+        if width is not None and width <= 0:
+            break
         children: list[_State] = []
         for state in frontier:
             if evals >= max_evals:
                 break
             already = state.moved
-            pool = [i for i in movable if i not in already][:width]
+            available = [i for i in movable if i not in already]
+            pool = available if width is None else available[:width]
             for idx in pool:
                 if evals >= max_evals:
                     break

@@ -188,12 +188,52 @@ corners from 415 matches across 8 competitions, out of 476 matches walked.
   The fix is one line — `torch.set_num_threads(1)` in `app.py`'s `main()`, or
   `OMP_NUM_THREADS=1` in the child environment `_cmd_app` builds — but it
   belongs to `app.py`, not to this audit.
-- The test suite is slow: roughly 46 s for `test_features`, 14 s for
-  `test_cli`, 8 s for `test_models`, and a few seconds for the rest. It is not
-  hanging; it is doing real work on real graphs. `pyproject.toml` declares
-  `slow` and `network` markers but exactly one test uses `slow` and none use
-  `network`, so `pytest -m "not slow"` buys almost nothing. Marking the heavy
-  cases would make the edit loop usable.
+- **The test suite is slower to start than it is to run, and the old per-file
+  figures here were measurement error.** "Roughly 46 s for `test_features`" was
+  recorded while three sibling checkouts were running their own suites on the
+  same ten-core machine (load average around 20), which inflates wall clock two
+  to four times. On a quiet machine `test_features` executes in 0.05 s. Measured
+  properly — `pytest -q --durations=0 --durations-min=0`, minimum of three runs,
+  summing call plus setup plus teardown per file:
+
+  | file | execution |
+  |---|---|
+  | `test_suggest_stress.py` | 9.78 s |
+  | `test_app.py` | 3.02 s |
+  | `test_cli.py` | 2.98 s |
+  | `test_suggest.py` | 0.76 s |
+  | `test_train.py` | 0.73 s |
+  | `test_models.py` | 0.23 s |
+  | `test_features.py` | 0.05 s |
+  | total | 17.55 s |
+
+  The whole run takes about 22.1 s, so 4.0 s of it is a fixed floor that no
+  marker can touch: `pytest --collect-only` alone costs 4.04 s, almost all of it
+  importing torch and torch_geometric. Any `-m` selection pays that first.
+
+  Five tests now carry `slow`: `train_all` run twice for reproducibility, the
+  smoke-dataset training run, the 100 ms inference benchmark, and the two
+  `app.py` tests that spawn a second interpreter. `pytest -m "not slow"` runs 310
+  of the 315 collected tests in 18.4 s against 22.1 s.
+
+  What is still unmarked is where the time actually is. `test_suggest_stress.py`
+  is 9.78 s, 56% of all execution, and carries no marks at all. The worst cases
+  are `test_hard_constraints_hold_with_the_candidate_restriction_lifted`
+  (1.70 s and 0.93 s for two of its parameter sets),
+  `test_identical_across_separate_processes` (1.44 s, a second interpreter
+  importing torch), `test_the_keeper_joins_the_pool_only_when_asked_across_the_sweep`
+  (1.15 s) and `test_a_full_search_on_a_22_player_frame_takes_about_a_second`
+  (0.70 s); in `test_cli.py` it is
+  `test_suggest_pretty_json_and_csv_agree_numerically` (0.72 s) and
+  `test_suggest_json_honours_movers_max_move_and_seed` (0.46 s). Marking those
+  seven would take a further 7.10 s out of `-m "not slow"`, which is the point at
+  which the fast subset becomes an edit loop rather than a rounding error.
+- The `network` marker declared in `pyproject.toml` has no user and should not
+  acquire one. Every test that goes near the fetch path deliberately *blocks* the
+  network — `tests/test_cli.py::no_network` replaces `_io.fetch_json`,
+  `socket.socket` and `socket.create_connection` with things that raise — so a
+  test that genuinely needed the network would be a bug rather than a marker
+  case. The marker should be dropped, but `pyproject.toml` is frozen.
 - `data/` and `runs/` are gitignored, so a fresh clone can score corners with
   the bundled checkpoints but cannot reproduce the metrics without a full
   `setpiece fetch` — several hundred matches at one request per second, about an
