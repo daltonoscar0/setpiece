@@ -144,7 +144,15 @@ def candidate_displacements(max_move: float, seed: int = 0) -> tuple[tuple[float
     by half a step so the two rings do not share bearings. ``seed`` only sets a
     global phase offset, so the set is deterministic for a given seed and every
     member has length ``<= max_move``.
+
+    A ``max_move`` that is not a positive finite number has no admissible
+    displacement at all, so the set is empty. Returning a ring anyway would hand
+    back either no-op moves (``max_move == 0``) or, for a negative budget, moves
+    of length ``abs(max_move)`` that breach the very bound they are meant to
+    respect.
     """
+    if not math.isfinite(max_move) or max_move <= 0.0:
+        return ()
     rng = random.Random(seed)
     step = 2.0 * math.pi / N_DIRECTIONS
     phase = rng.random() * step
@@ -275,15 +283,24 @@ def suggest(
     Returns:
         Suggestions ranked best first: by ``delta`` ascending when ``defend`` is
         True, descending when it is False. Every returned suggestion has at least
-        one move. An empty list means no admissible move exists — a frame with no
-        movable defender, ``movers <= 0``, or a shape so tight that every
-        candidate displacement breaches ``min_sep`` or the touchline.
+        one move, and every move has non-zero length. An empty list means no
+        admissible move exists — a frame with no movable defender, ``movers <= 0``,
+        a ``max_move`` that is not positive and finite, or a shape so tight that
+        every candidate displacement breaches ``min_sep`` or the touchline.
+
+    Pre-existing overlaps: if two players are already closer than ``min_sep`` in
+    ``frame``, the search will not repair the pair unless it happens to move one
+    of them. What it guarantees is the stronger, checkable half — every *moved*
+    player ends at least ``min_sep`` from every other player, so no returned
+    suggestion ever creates a tight pair or leaves one touching a mover.
     """
     scorer = _resolve_scorer(shot_model)
     base_prob = scorer(frame)
 
     limit = beam if top_k is None else top_k
     if limit <= 0 or movers <= 0 or beam <= 0 or max_evals <= 0:
+        return []
+    if not math.isfinite(max_move) or max_move <= 0.0:
         return []
 
     movable = _movable(frame, move_keeper)

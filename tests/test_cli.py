@@ -11,6 +11,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import re
 import socket
 import sys
 import types
@@ -535,6 +536,27 @@ def test_importing_the_cli_pulls_in_nothing_heavy() -> None:
     assert result.stdout.strip() == "[]"
 
 
+def install_train_stub(monkeypatch: pytest.MonkeyPatch, stub: types.ModuleType) -> None:
+    """Make ``from setpiece import train`` resolve to ``stub``, and undo it after.
+
+    Patching ``sys.modules`` alone is not enough. ``from setpiece import train``
+    is served by ``importlib._bootstrap._handle_fromlist``, which returns the
+    ``train`` *attribute* of the already-imported ``setpiece`` package whenever
+    that attribute exists — and it exists as soon as anything has imported
+    ``setpiece.train``, which collecting ``tests/test_train.py`` does. So the
+    stub has to go on the package too, otherwise these tests quietly run the
+    real trainer: a full cross-validated fit over the whole corpus that takes
+    minutes and overwrites ``docs/metrics.md`` and ``runs/latest``.
+
+    Both entries are set, because ``sys.modules`` is what covers the case where
+    ``setpiece.train`` has never been imported at all.
+    """
+    import setpiece
+
+    monkeypatch.setitem(sys.modules, "setpiece.train", stub)
+    monkeypatch.setattr(setpiece, "train", stub, raising=False)
+
+
 def test_train_forwards_its_arguments(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -546,11 +568,30 @@ def test_train_forwards_its_arguments(
         return 0
 
     stub.main = fake_main  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "setpiece.train", stub)
+    install_train_stub(monkeypatch, stub)
 
     code, _, _ = run(["train", "--epochs", "2", "--data", "x.jsonl"], capsys)
     assert code == cli.EXIT_OK
     assert seen["argv"] == ["--epochs", "2", "--data", "x.jsonl"]
+
+
+def test_train_stub_actually_replaces_the_real_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guard the guard: if the stub stops taking effect, say so here.
+
+    Without this the three tests below would keep passing in isolation while
+    silently invoking the real trainer in a full-suite run.
+    """
+    import setpiece.train as real_train  # noqa: F401  (force the real import first)
+
+    stub = types.ModuleType("setpiece.train")
+    stub.main = lambda argv: 0  # type: ignore[attr-defined]
+    install_train_stub(monkeypatch, stub)
+
+    from setpiece import train as resolved
+
+    assert resolved is stub
 
 
 def test_train_propagates_a_failing_exit_code(
@@ -558,7 +599,7 @@ def test_train_propagates_a_failing_exit_code(
 ) -> None:
     stub = types.ModuleType("setpiece.train")
     stub.main = lambda argv: 7  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "setpiece.train", stub)
+    install_train_stub(monkeypatch, stub)
     code, _, _ = run(["train"], capsys)
     assert code == 7
 
@@ -567,7 +608,7 @@ def test_train_reports_a_module_with_no_entry_point(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     stub = types.ModuleType("setpiece.train")
-    monkeypatch.setitem(sys.modules, "setpiece.train", stub)
+    install_train_stub(monkeypatch, stub)
     code, _, err = run(["train"], capsys)
     assert code == cli.EXIT_ERROR
     assert "entry point" in err
@@ -605,3 +646,257 @@ def test_fetch_is_wired_to_build_dataset(
     assert seen["only_competitions"] == ["UEFA Euro"]
     assert seen["max_matches"] == 2
     assert "9 corners" in out
+
+
+# --------------------------------------------------------------------------- #
+# audit: the real bundled checkpoints
+#
+# Everything above deliberately runs against freshly initialised networks, so it
+# asserts plumbing and nothing else. The block below is the other half: the
+# checkpoints actually shipped in setpiece/assets/, exercised the way a user
+# would with no flags at all. It checks the three promises that only hold end to
+# end - demo really is offline, malformed input really does exit non-zero, and
+# the three output formats really do agree on the numbers rather than merely
+# looking similar.
+# --------------------------------------------------------------------------- #
+@pytest.fixture(scope="module")
+def bundled() -> None:
+    """Skip unless both bundled checkpoints are present and loadable."""
+    from setpiece import models
+
+    for kind in ("receiver", "shot"):
+        path = models.ASSETS_DIR / f"{kind}.pt"
+        if not path.exists():
+            pytest.skip(f"no bundled {kind} checkpoint at {path}; run setpiece train")
+
+
+def test_demo_is_offline_against_the_bundled_models(
+    bundled: None, no_network: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No --model, no network. ``_io.fetch_json`` raising must not be reached."""
+    code, out, err = run(["demo"], capsys)
+    assert code == cli.EXIT_OK, err
+    assert out.count("P(shot within 5 events)") == 3
+    assert "no network access" in out
+
+
+def test_demo_with_the_bundled_models_finishes_under_ten_seconds(
+    bundled: None, no_network: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The ten second budget, measured on the real checkpoints.
+
+    Timed inside the process, so ``import torch`` and ``import torch_geometric``
+    are already paid for. A cold ``setpiece demo`` on a laptop spends roughly
+    eight seconds in those two imports alone before it scores anything, which is
+    recorded in ``startup_seconds`` and noted in TODO.md.
+    """
+    import time
+
+    started = time.perf_counter()
+    code, out, _ = run(["demo", "--format", "json"], capsys)
+    elapsed = time.perf_counter() - started
+    assert code == cli.EXIT_OK
+
+    payload = json.loads(out)
+    assert len(payload["corners"]) == 3
+    for entry in payload["corners"]:
+        assert entry["suggest"]["suggestions"]
+        assert 0.0 <= entry["score"]["p_shot"] <= 1.0
+    assert elapsed < 10.0, f"demo took {elapsed:.1f}s"
+
+    compute = payload["seconds"] - payload["startup_seconds"]
+    assert compute < 5.0, f"demo spent {compute:.1f}s scoring three corners"
+
+
+# --------------------------------------------------------------------------- #
+# the three formats must agree on the numbers, not just on the shape
+# --------------------------------------------------------------------------- #
+#: One row of the pretty score table: index (or "-" for the defence class),
+#: role, optional x and y, then the probability at three decimal places.
+_SCORE_ROW = re.compile(
+    r"^\s*(?P<idx>\d+|-)\s+(?:attack|taker|keeper|defence)\s+"
+    r"(?P<x>[\d.]*)\s*(?P<y>[\d.]*)\s+(?P<p>\d\.\d{3})\b"
+)
+
+#: One row of the pretty suggestion table: rank, new probability, signed delta.
+_SUGGEST_ROW = re.compile(r"^\s*(?P<rank>\d+)\s+(?P<new>\d\.\d{3})\s+(?P<delta>[+-]\d\.\d{3})\s")
+
+
+def test_score_pretty_json_and_csv_agree_numerically(
+    bundled: None, corner_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _, pretty, _ = run(["score", str(corner_path), "--format", "pretty"], capsys)
+    _, as_json, _ = run(["score", str(corner_path), "--format", "json"], capsys)
+    _, as_csv, _ = run(["score", str(corner_path), "--format", "csv"], capsys)
+    payload = json.loads(as_json)
+
+    # csv carries six decimals, so it must match json to well inside that
+    rows = list(csv.DictReader(io.StringIO(as_csv)))
+    assert len(rows) == len(payload["players"]) + 1
+    for row in rows:
+        assert float(row["p_shot"]) == pytest.approx(payload["p_shot"], abs=5e-7)
+        if row["idx"] == "-1":
+            assert float(row["p_receive"]) == pytest.approx(
+                payload["p_defence_first_contact"], abs=5e-7
+            )
+            continue
+        player = payload["players"][int(row["idx"])]
+        assert float(row["p_receive"]) == pytest.approx(player["p_receive"], abs=5e-7)
+        assert float(row["x"]) == pytest.approx(player["x"], abs=5e-3)
+        assert float(row["y"]) == pytest.approx(player["y"], abs=5e-3)
+        assert row["team"] == player["team"]
+
+    # pretty carries three decimals and lists only players with mass
+    seen = {
+        m.group("idx"): float(m.group("p"))
+        for m in (_SCORE_ROW.match(line) for line in pretty.splitlines())
+        if m
+    }
+    assert seen, "no rows parsed out of the pretty score table"
+    with_mass = sorted(p["idx"] for p in payload["players"] if p["p_receive"] > 0.0)
+    assert sorted(int(k) for k in seen if k != "-") == with_mass
+    assert seen["-"] == pytest.approx(payload["p_defence_first_contact"], abs=5e-4)
+    for key, value in seen.items():
+        if key != "-":
+            assert value == pytest.approx(payload["players"][int(key)]["p_receive"], abs=5e-4)
+
+    shot = re.search(r"P\(shot within 5 events\)\s+(\d\.\d{3})", pretty)
+    assert shot is not None
+    assert float(shot.group(1)) == pytest.approx(payload["p_shot"], abs=5e-4)
+
+    # and the receiver head really is a distribution
+    total = sum(p["p_receive"] for p in payload["players"])
+    assert total + payload["p_defence_first_contact"] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_suggest_pretty_json_and_csv_agree_numerically(
+    bundled: None, corner_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    argv = ["suggest", str(corner_path), "--seed", "0", "--movers", "2", "--top-k", "4"]
+    _, pretty, _ = run([*argv, "--format", "pretty"], capsys)
+    _, as_json, _ = run([*argv, "--format", "json"], capsys)
+    _, as_csv, _ = run([*argv, "--format", "csv"], capsys)
+    payload = json.loads(as_json)
+    assert payload["suggestions"]
+
+    by_rank: dict[int, list[dict[str, str]]] = {}
+    for row in csv.DictReader(io.StringIO(as_csv)):
+        by_rank.setdefault(int(row["rank"]), []).append(row)
+
+    for suggestion in payload["suggestions"]:
+        rows = by_rank[suggestion["rank"]]
+        assert len(rows) == len(suggestion["moves"])
+        for row, move in zip(rows, suggestion["moves"], strict=True):
+            assert float(row["base_prob"]) == pytest.approx(suggestion["base_prob"], abs=5e-7)
+            assert float(row["new_prob"]) == pytest.approx(suggestion["new_prob"], abs=5e-7)
+            assert float(row["delta"]) == pytest.approx(suggestion["delta"], abs=5e-7)
+            assert int(row["player_idx"]) == move["player_idx"]
+            assert float(row["dx"]) == pytest.approx(move["dx"], abs=5e-4)
+            assert float(row["dy"]) == pytest.approx(move["dy"], abs=5e-4)
+
+    parsed = [m for m in (_SUGGEST_ROW.match(line) for line in pretty.splitlines()) if m]
+    assert len(parsed) == len(payload["suggestions"])
+    for match, suggestion in zip(parsed, payload["suggestions"], strict=True):
+        assert int(match.group("rank")) == suggestion["rank"]
+        assert float(match.group("new")) == pytest.approx(suggestion["new_prob"], abs=5e-4)
+        assert float(match.group("delta")) == pytest.approx(suggestion["delta"], abs=5e-4)
+
+    base = re.search(r"base P\(shot\) (\d\.\d{3})", pretty)
+    assert base is not None
+    assert float(base.group(1)) == pytest.approx(payload["base_p_shot"], abs=5e-4)
+
+
+# --------------------------------------------------------------------------- #
+# malformed input is reported, never scored and never a traceback
+# --------------------------------------------------------------------------- #
+def _write(tmp_path: Path, name: str, text: str) -> Path:
+    path = tmp_path / name
+    path.write_text(text)
+    return path
+
+
+BROKEN_CORNERS = {
+    "truncated.json": "{ not json",
+    "unknown_shape.json": '{"foo": 1}',
+    "player_missing_fields.json": '{"corner_id":"c","players":[{"x":1.0}]}',
+    "unknown_top_level_key.json": (
+        '{"corner_id":"c","players":[{"x":1.0,"y":2.0,"is_attacker":true}],"bogus":3}'
+    ),
+    "no_players.json": '{"corner_id":"c","players":[],"meta":{}}',
+    "bad_number.csv": "team,x,y\nattack,abc,2.0\n",
+    "unknown_team.csv": "team,x,y\nspectator,1.0,2.0\n",
+    "broken_line.jsonl": (
+        '{"corner_id":"c","players":[{"x":1,"y":2,"is_attacker":true}]}\nnot json\n'
+    ),
+    "empty.jsonl": "",
+}
+
+
+@pytest.mark.parametrize("name", sorted(BROKEN_CORNERS))
+@pytest.mark.parametrize("command", ["score", "suggest"])
+def test_a_malformed_corner_exits_one_with_a_message(
+    bundled: None,
+    command: str,
+    name: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Every parse failure is a reported error, not a traceback and not a score.
+
+    ``main`` promises never to raise for user error, but the loader can fail with
+    ``TypeError`` when a hand-written player dict is missing a field, or with
+    ``KeyError`` on an unknown key - neither of which the top-level handler
+    catches. ``_load_frames`` normalises them.
+    """
+    path = _write(tmp_path, name, BROKEN_CORNERS[name])
+    code, out, err = run([command, str(path)], capsys)
+    assert code == cli.EXIT_ERROR, f"{name} produced {out!r}"
+    assert err.startswith("error: ")
+    assert "Traceback" not in err
+
+
+def test_a_corner_with_no_players_is_never_given_a_probability(
+    bundled: None, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An empty freeze frame used to score cleanly and print a shot probability.
+
+    The models consume an empty graph without complaint and return a number, but
+    that number describes nobody. Refusing it is the only honest answer.
+    """
+    path = _write(tmp_path, "empty.json", '{"corner_id":"c","players":[],"meta":{}}')
+    code, out, err = run(["score", str(path), "--format", "json"], capsys)
+    assert code == cli.EXIT_ERROR
+    assert "no players" in err
+    assert out == ""
+
+
+def test_a_bad_flag_is_a_usage_error_for_every_subcommand() -> None:
+    for argv in (
+        ["score", "c.json", "--format", "yaml"],
+        ["suggest", "c.json", "--movers", "banana"],
+        ["suggest", "c.json", "--wibble"],
+        ["demo", "--format", "toml"],
+        ["fetch", "--max-matches", "lots"],
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            cli.main(argv)
+        assert excinfo.value.code == cli.EXIT_USAGE, argv
+
+
+def test_a_negative_max_move_yields_no_suggestion_rather_than_an_illegal_one(
+    bundled: None, corner_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--max-move -1`` used to return eight moves of length 1.0 m.
+
+    The candidate ring rescales any member longer than ``max_move`` back onto the
+    bound; with a negative bound the comparison is true for every member and the
+    rescale flips the sign instead of shrinking it.
+    """
+    for value in ("-1", "0"):
+        code, out, _ = run(
+            ["suggest", str(corner_path), "--max-move", value, "--format", "json"], capsys
+        )
+        assert code == cli.EXIT_OK
+        payload = json.loads(out)
+        assert payload["suggestions"] == []
+        assert payload["base_p_shot"] is None

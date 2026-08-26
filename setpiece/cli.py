@@ -180,18 +180,39 @@ def _tune_torch_threads() -> None:
 
 
 def _load_frames(path: str | Path) -> list[CornerFrame]:
-    """Load one corner file, or every corner in a ``.jsonl`` dataset."""
+    """Load one corner file, or every corner in a ``.jsonl`` dataset.
+
+    Every parse failure is normalised to :class:`ValueError` so ``main`` reports
+    it as ``error: ...`` and :data:`EXIT_ERROR`. A hand-written corner file can
+    fail in ways the loader does not anticipate — a player dict missing ``y``, an
+    unknown top-level key — and those surface as ``TypeError`` or ``KeyError``
+    from the dataclass constructors, which would otherwise escape as a traceback.
+
+    A corner with no players is rejected rather than scored. The models happily
+    consume an empty graph and return a probability, and that number is a
+    fabrication: it describes no one.
+    """
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"no such corner file: {path}")
     from setpiece import _io
 
-    if path.suffix.lower() in {".jsonl", ".ndjson"}:
-        frames = _io.read_corners(path)
-        if not frames:
-            raise ValueError(f"{path} contains no corners")
-        return frames
-    return [_io.load_corner(path)]
+    try:
+        if path.suffix.lower() in {".jsonl", ".ndjson"}:
+            frames = _io.read_corners(path)
+        else:
+            frames = [_io.load_corner(path)]
+    except (ValueError, OSError):
+        raise
+    except Exception as exc:
+        raise ValueError(f"malformed corner file {path}: {exc}") from exc
+
+    if not frames:
+        raise ValueError(f"{path} contains no corners")
+    for frame in frames:
+        if not frame.players:
+            raise ValueError(f"corner {frame.corner_id!r} in {path} has no players")
+    return frames
 
 
 def demo_frames() -> list[CornerFrame]:

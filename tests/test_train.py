@@ -166,6 +166,20 @@ def test_auc_rejects_length_mismatch() -> None:
         roc_auc([1, 0, 1], [0.1, 0.2])
 
 
+def test_auc_rejects_non_finite_scores() -> None:
+    """A missing prediction must fail loudly, not sort to the top.
+
+    ``np.argsort`` puts ``nan`` last, so an unscored row would silently take the
+    best rank: without the guard ``roc_auc([0, 1, 1], [0.1, nan, 0.9])`` returns
+    a perfect 1.0. The out-of-fold arrays are pre-filled with ``nan``, so a hole
+    in them has to raise rather than read as skill.
+    """
+    with pytest.raises(ValueError):
+        roc_auc([0, 1, 1], [0.1, float("nan"), 0.9])
+    with pytest.raises(ValueError):
+        roc_auc([0, 1], [0.1, float("inf")])
+
+
 # --------------------------------------------------------------------------- #
 # purged splits
 # --------------------------------------------------------------------------- #
@@ -384,6 +398,50 @@ def test_train_all_end_to_end(tmp_path: Path) -> None:
     assert "| GNN |" in text
     assert "purged" in text
     assert (out / "report.json").exists()
+
+    # Top-3 has a floor: a corner with three or fewer candidates is a free hit for
+    # every model, so the table has to print the chance level next to the column
+    # or 0.7 looks like skill it may not be.
+    chance3 = report["receiver"]["chance"]["top3_attacker"]
+    assert f"{chance3:.3f}" in text, "the top-3 chance level is computed but not reported"
+    assert "free hit" in text
+    # a fully grouped dataset must not carry the ungrouped caveat
+    assert report["splits"]["n_ungrouped_corners"] == 0
+    assert "carry no `match_id`" not in text
+
+
+def test_corners_without_match_id_are_flagged_as_unpurged(tmp_path: Path) -> None:
+    """A corner with no ``match_id`` is its own group, so it is not purged.
+
+    That is the safe default, but the metrics table claims corners are grouped by
+    match, and for these rows that claim is unverifiable. It has to say so.
+    """
+    frames = [
+        make_frame(f"c{i}", match_id=1000 + i // 3, seed=i, shot=(i % 3 == 0))
+        for i in range(18)
+    ]
+    for frame in frames[:5]:
+        frame.match_id = None
+    path = tmp_path / "d.jsonl"
+    write_corners(frames, path)
+
+    metrics = tmp_path / "metrics.md"
+    report = train_all(
+        path,
+        tmp_path / "run",
+        folds=2,
+        epochs=1,
+        hidden=8,
+        layers=2,
+        batch_size=8,
+        baseline_iters=5,
+        metrics_path=metrics,
+        quiet=True,
+    )
+    assert report["splits"]["n_ungrouped_corners"] == 5
+    text = metrics.read_text()
+    assert "carry no `match_id`" in text
+    assert "*not* purged" in text
 
 
 def test_metrics_are_in_range(tmp_path: Path) -> None:

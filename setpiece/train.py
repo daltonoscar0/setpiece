@@ -100,7 +100,17 @@ RECEIVER_METRIC_KEYS: tuple[str, ...] = (
 # reproducibility
 # --------------------------------------------------------------------------- #
 def set_seed(seed: int) -> None:
-    """Seed python, numpy and torch. CPU training is then bit-reproducible."""
+    """Seed python, numpy and torch.
+
+    CPU training is bit-reproducible *at a fixed intra-op thread count*, and only
+    then. Torch's parallel reductions sum in thread-partition order, so the same
+    seed on the same data yields different weights under a different
+    ``torch.get_num_threads()`` — measured here as a change in the fitted
+    receiver weights between 4 threads and 1, and as GNN metrics that move in the
+    third decimal between runs on differently loaded machines. The thread count
+    is recorded in every model card so a number can be traced back to it. The
+    linear baselines are dense single-kernel ops and do reproduce exactly.
+    """
     random.seed(seed)
     np.random.seed(seed % (2**32))
     torch.manual_seed(seed)
@@ -132,11 +142,21 @@ def roc_auc(y_true: Sequence[float] | np.ndarray, y_score: Sequence[float] | np.
     in ``y_score`` get their average rank, which is the standard convention and
     makes a constant score come out at exactly 0.5. Returns ``nan`` when one of
     the two classes is absent, because the quantity is then undefined.
+
+    A non-finite score is rejected rather than ranked. ``np.argsort`` sorts
+    ``nan`` to the end, which silently hands every missing prediction the *best*
+    rank and inflates the AUC — a hole in an out-of-fold prediction array would
+    then read as skill instead of failing loudly.
     """
     truth = np.asarray(y_true, dtype=np.float64).reshape(-1) > 0.5
     scores = np.asarray(y_score, dtype=np.float64).reshape(-1)
     if truth.size != scores.size:
         raise ValueError(f"length mismatch: {truth.size} labels, {scores.size} scores")
+    if scores.size and not bool(np.isfinite(scores).all()):
+        raise ValueError(
+            f"{int((~np.isfinite(scores)).sum())} of {scores.size} scores are not finite; "
+            "an unscored row must not be ranked"
+        )
     n_pos = int(truth.sum())
     n_neg = int(truth.size - n_pos)
     if n_pos == 0 or n_neg == 0:
@@ -287,6 +307,13 @@ def _row_from_frame(frame: CornerFrame) -> Row:
             target_pos = int(hits[0])
 
     is_attacker = np.asarray([p.is_attacker for p in frame.players], dtype=bool)
+    # Grouping key for the purged split. A corner with no ``match_id`` — user CSV
+    # and ad-hoc JSON inputs carry none — becomes its own singleton group rather
+    # than joining one shared bucket, because collapsing them would put every
+    # unlabelled corner in a single fold. The consequence is that such corners
+    # are *not* purged against each other: if two of them come from the same
+    # match, that match can straddle a fold boundary and nothing here can tell.
+    # ``_split_summary`` counts them so the metrics table can say so out loud.
     group = str(frame.match_id) if frame.match_id is not None else f"corner:{frame.corner_id}"
     return Row(
         corner_id=frame.corner_id,
@@ -361,12 +388,17 @@ def _split_summary(rows: Sequence[Row], assignment: np.ndarray) -> dict[str, Any
     fold_rows = [int((assignment == f).sum()) for f in range(n_folds)]
     fold_groups = [len({rows[i].group for i in np.nonzero(assignment == f)[0]}) for f in
                    range(n_folds)]
+    ungrouped = sum(1 for r in rows if r.match_id is None)
     return {
         "scheme": "purged group k-fold on match_id; every corner of a match in one fold",
         "n_folds": n_folds,
         "rows_per_fold": fold_rows,
         "matches_per_fold": fold_groups,
         "n_matches": len({r.group for r in rows}),
+        # Corners with no match_id are singleton groups, so they are not purged
+        # against one another. Nonzero here means the purging claim is weaker
+        # than the scheme string suggests.
+        "n_ungrouped_corners": ungrouped,
         "evaluation": "pooled out-of-fold predictions; each corner scored once, unseen match",
     }
 
@@ -785,11 +817,20 @@ def format_metrics_markdown(report: dict[str, Any]) -> str:
         f"{splits['matches_per_fold']}."
     )
     lines.append("")
+    if splits.get("n_ungrouped_corners"):
+        lines.append(
+            f"**Caveat:** {splits['n_ungrouped_corners']} of these corners carry no "
+            "`match_id`, so each was treated as a match of its own. Any two of them that "
+            "actually came from the same match were *not* purged against each other, and "
+            "the match counts above count those corners individually."
+        )
+        lines.append("")
     lines.append("Freeze frames carry no velocities, so every model here is `assume_static`.")
     lines.append("")
 
     lines.append("## receiver head")
     lines.append("")
+    dropped = int(data["n_corners"]) - int(receiver["gnn"]["n_rows"])
     lines.append(
         f"Scored on {int(receiver['gnn']['n_rows'])} corners with a usable receiver label, of "
         f"which {int(receiver['gnn']['n_attacker_first'])} were won by an attacker. Top-1 and "
@@ -799,6 +840,17 @@ def format_metrics_markdown(report: dict[str, Any]) -> str:
         "across every scored row."
     )
     lines.append("")
+    if dropped > 0:
+        lines.append(
+            f"The other {dropped} corners carry no usable receiver label — almost all of them "
+            "attacker-first corners whose receiver was not visible in the freeze frame, so "
+            "there is no node to point at. That filter removes attacker-first rows far more "
+            "often than defence-wins rows, which leaves the scored subset more defence-heavy "
+            "than the dataset as a whole. All three models are scored on exactly these rows, "
+            "so the columns compare cleanly against each other, but the overall-accuracy and "
+            "defence-AUC figures are not population estimates."
+        )
+        lines.append("")
     lines.append(
         "| model | top-1 (attacker-first) | top-3 (attacker-first) | "
         "overall acc. incl. defence | defence-wins AUC |"
@@ -812,9 +864,12 @@ def format_metrics_markdown(report: dict[str, Any]) -> str:
         )
     lines.append("")
     lines.append(
-        f"Random guessing over the candidates would score about "
-        f"{_fmt(receiver['chance']['top1_attacker'])} top-1; always predicting "
-        f"\"defence wins\" would score {_fmt(receiver['always_defence_accuracy'])} overall."
+        f"Chance level over the candidates is {_fmt(receiver['chance']['top1_attacker'])} "
+        f"top-1 and {_fmt(receiver['chance']['top3_attacker'])} top-3. Top-3 has a high floor "
+        "by construction: a corner with three or fewer candidate attackers is a free hit for "
+        "every model, so read the top-3 column against that floor and not against zero. "
+        "Always predicting \"defence wins\" would score "
+        f"{_fmt(receiver['always_defence_accuracy'])} overall."
     )
     lines.append("")
 
@@ -824,8 +879,10 @@ def format_metrics_markdown(report: dict[str, Any]) -> str:
         f"Binary `shot_within_5`, scored on all {int(shot['gnn']['n_rows'])} held-out corners. "
         f"Base rate {_fmt(shot['gnn']['base_rate'])}. The heuristic is the training-fold shot "
         "rate — a constant within a fold, so it carries no information about an individual "
-        "corner and sits at chance apart from the small wobble between fold base rates. It is "
-        "here as the floor."
+        "corner. It lands a little *below* 0.5 rather than on it, and that is mechanical "
+        "rather than noise: the training-fold rate is a strictly decreasing function of the "
+        "held-out fold's own rate, so the score is mildly anti-correlated with the label by "
+        "construction. Read it as the floor; the gap between it and 0.5 is not a signal."
     )
     lines.append("")
     lines.append("| model | AUC |")
@@ -983,6 +1040,15 @@ def train_all(
             "logreg": logreg_recv.predict(test_recv_rows),
         }
         for name, (cand_probs, p_def) in preds.items():
+            # The table is only a comparison if all three models are scored on
+            # exactly these rows in exactly this order. A predictor returning a
+            # longer list would otherwise misalign silently and never raise.
+            if len(cand_probs) != len(test_recv_idx) or len(p_def) != len(test_recv_idx):
+                raise RuntimeError(
+                    f"{name} returned {len(cand_probs)} candidate distributions and "
+                    f"{len(p_def)} defence probabilities for {len(test_recv_idx)} held-out "
+                    "receiver rows; every model must be scored on the identical rows"
+                )
             for slot, row_id in enumerate(test_recv_idx):
                 oof_receiver[name][row_id] = (cand_probs[slot], float(p_def[slot]))
 
@@ -1061,6 +1127,8 @@ def train_all(
         "baseline_iters": baseline_iters,
         "optimiser": "adam",
         "final_fit": "refit on every corner after cross-validation",
+        # Reproducing these numbers exactly needs the thread count too; see set_seed.
+        "torch_threads": int(torch.get_num_threads()),
     }
     report: dict[str, Any] = {
         "date": date.today().isoformat(),

@@ -474,6 +474,32 @@ def test_features_ignore_label_adjacent_meta(corners: list[CornerFrame]) -> None
         np.testing.assert_array_equal(flat, build_flat(poisoned))
 
 
+def test_features_ignore_the_supervision_labels(corners: list[CornerFrame]) -> None:
+    """The outcome labels themselves must not reach ``x``, ``edge_attr`` or the mask.
+
+    ``meta`` is the obvious trap and is covered above, but ``first_touch``,
+    ``receiver_idx``, ``receiver_match_dist`` and ``shot_within_5`` are the labels
+    the heads are trained against: if any of them changed a single feature the
+    cross-validated numbers would be measuring themselves.
+    """
+    for frame in corners:
+        g = build_graph(frame)
+        flat = build_flat(frame)
+
+        poisoned = frame.with_players(list(frame.players))
+        poisoned.first_touch = "defender" if frame.first_touch != "defender" else "attacker"
+        poisoned.receiver_idx = None
+        poisoned.receiver_match_dist = 999.0
+        poisoned.shot_within_5 = not bool(frame.shot_within_5)
+        h = build_graph(poisoned)
+
+        assert torch.equal(g.x, h.x)
+        assert torch.equal(g.edge_index, h.edge_index)
+        assert torch.equal(g.edge_attr, h.edge_attr)
+        assert torch.equal(g.candidate_mask, h.candidate_mask)
+        np.testing.assert_array_equal(flat, build_flat(poisoned))
+
+
 def test_features_work_without_meta() -> None:
     frame = synthetic_frame()
     assert frame.meta == {}
