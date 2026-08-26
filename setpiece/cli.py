@@ -99,8 +99,9 @@ class ModelUnavailableError(RuntimeError):
 def _train_hint(kind: str, path: Path) -> str:
     return (
         f"no trained '{kind}' model available (looked for {path}).\n"
-        f"Train one, which writes the bundled checkpoints:\n"
-        f"    uv run setpiece train\n"
+        f"Train one and install it as the bundled checkpoint:\n"
+        f"    uv run setpiece train --install\n"
+        f"(plain 'setpiece train' only writes to --out-dir, default runs/latest)\n"
         f"or point at an existing checkpoint:\n"
         f"    uv run setpiece <command> --model path/to/{kind}.pt\n"
         f"(--model also accepts a directory holding receiver.pt and shot.pt)."

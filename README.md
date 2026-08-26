@@ -38,8 +38,15 @@ no training needed.
 uv run setpiece demo
 ```
 
-It touches no network and finishes in about eleven seconds, most of which is
-importing torch. Abridged output:
+It touches no network. Scoring and searching the three corners takes about
+0.3 s; the rest is importing torch and loading the checkpoints, which puts a
+warm run at roughly 5 s end to end.
+
+One caveat worth knowing: the very first run in a freshly created venv pays a
+one-off cost to page torch in from disk. Measured on a clean clone here that
+took 46 s, dropping to 7 s on the second run and 5 s thereafter. That is a
+property of importing torch, not of the model — inference itself is about
+2.5 ms per corner. Abridged output:
 
 ```
 setpiece demo: three real Euro 2024 corners, scored offline
@@ -426,13 +433,22 @@ Data provided by StatsBomb.
 
 ## Screenshots
 
-These land with the first tagged release; the files are not in the tree yet.
+Both images below are produced by the app's own PNG export (`render_png`), so
+they are exactly what the export button writes — same drawing, same header.
 
-- `assets/pitch-editor.png` — the Streamlit editor mid-drag, with the receiver
-  probabilities and P(shot) alongside the pitch.
-- `assets/suggest-overlay.png` — the same corner with the proposed defender
-  moves drawn as arrows.
-- `assets/score-cli.png` — `setpiece score` output in a terminal.
+A scored corner. Each attacker carries its probability of winning first
+contact; the header shows P(shot within 5 events) and P(defence wins first
+contact), with the static-frame caveat:
+
+![A scored corner](assets/pitch-editor.png)
+
+The same corner after `suggest`, with the three proposed defender moves drawn
+as arrows. This one takes P(shot) from 0.214 to 0.175:
+
+![Suggested defender moves](assets/suggest-overlay.png)
+
+The CLI output is shown inline throughout this README and in `docs/usage.md`
+rather than as an image, so it stays copy-pasteable and greppable.
 
 ## Documentation
 

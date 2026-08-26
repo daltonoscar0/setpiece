@@ -154,21 +154,23 @@ corners from 415 matches across 8 competitions, out of 476 matches walked.
 
 ## tooling and docs
 
-- **`setpiece train` does not update the bundled checkpoints.** It writes
-  `receiver.pt`, `shot.pt` and `report.json` to `--out-dir` (default
-  `runs/latest`), and the checkpoints under `setpiece/assets/` have to be
-  replaced by hand. The missing-model message in `setpiece/cli.py`
-  (`_train_hint`) says "Train one, which writes the bundled checkpoints", which
-  is wrong. Either make `train` write the assets or fix the message; `cli.py` is
-  not this task's file to edit.
-- **There is no `LICENSE` file.** `pyproject.toml` declares MIT and `README.md`
-  says so, but the text is not in the tree. Add it before publishing, along with
-  a note that the StatsBomb Public Data User Agreement — not MIT — governs the
-  data, the bundled demo corners and the trained checkpoints.
-- **Screenshots are not in the tree.** `README.md` references
-  `assets/pitch-editor.png`, `assets/suggest-overlay.png` and
-  `assets/score-cli.png`; `assets/` is currently empty. They land at the first
-  tagged release.
+- ~~`setpiece train` does not update the bundled checkpoints.~~ Fixed: `train`
+  takes `--install`, which copies the two refitted checkpoints over the bundled
+  ones in `setpiece/assets/`. Plain `train` still writes only to `--out-dir`
+  (default `runs/latest`), and the `_train_hint` message in `setpiece/cli.py`
+  now says so. Note the sharp edge: `--install` will happily overwrite good
+  checkpoints with a smoke run, so pair it with a real `--dataset`.
+- ~~There is no `LICENSE` file.~~ Added, MIT, with an explicit note that the
+  StatsBomb Public Data User Agreement — not MIT — governs the downloaded data,
+  the bundled demo corners and the trained checkpoints.
+- ~~Screenshots are not in the tree.~~ `assets/pitch-editor.png` and
+  `assets/suggest-overlay.png` are committed and referenced from `README.md`.
+  Both come from the app's own `render_png` export path, so they are the real
+  drawing rather than a mock-up. Still missing: a screenshot of the live
+  Streamlit UI *as a page* (browser chrome, sidebar, the canvas mid-drag) —
+  that needs a browser and was not capturable in the environment this was built
+  in. `assets/score-cli.png` was dropped on purpose; CLI output is shown inline
+  in `README.md` and `docs/usage.md` so it stays copy-pasteable.
 - `setpiece demo` meets the ten second budget in process — it reports about 1.3 s
   of scoring and searching plus about 7 s to import torch and load the
   checkpoints — but measured end to end through `uv run` on a cold cache the

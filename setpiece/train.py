@@ -28,6 +28,7 @@ import argparse
 import json
 import math
 import random
+import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
@@ -942,6 +943,7 @@ def train_all(
     limit: int | None = None,
     metrics_path: str | Path | None = None,
     quiet: bool = False,
+    install: bool = False,
 ) -> dict[str, Any]:
     """Cross-validate both heads, evaluate the baselines, then fit and save.
 
@@ -950,6 +952,10 @@ def train_all(
     to stdout and to ``metrics_path`` (``docs/metrics.md`` by default), then
     refits each head on the whole dataset and saves ``receiver.pt`` and
     ``shot.pt`` into ``out_dir`` with a fully populated model card.
+
+    With ``install``, the two refitted checkpoints are also copied over the
+    bundled ones in ``setpiece/assets/``, which is what ``score``, ``suggest``,
+    ``demo`` and the app load by default.
 
     Returns the report dict: ``data``, ``splits``, ``receiver``, ``shot``,
     ``params``, ``paths``, ``date``, ``training``.
@@ -1184,6 +1190,19 @@ def train_all(
         log(f"wrote {target}")
     (out_dir / "report.json").write_text(json.dumps(report, indent=2, default=str))
     report["paths"]["report"] = str(out_dir / "report.json")
+
+    if install:
+        from setpiece.models import ASSETS_DIR
+
+        ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+        installed = {}
+        for name in ("receiver", "shot"):
+            target = ASSETS_DIR / f"{name}.pt"
+            shutil.copyfile(out_dir / f"{name}.pt", target)
+            installed[name] = str(target)
+            log(f"installed {target}")
+        report["paths"]["installed"] = installed
+
     return report
 
 
@@ -1208,6 +1227,11 @@ def add_train_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
         help="markdown metrics table destination (default: %(default)s)",
     )
     parser.add_argument("--no-metrics-file", action="store_true", help="print the table only")
+    parser.add_argument(
+        "--install",
+        action="store_true",
+        help="also copy the refitted checkpoints over the bundled ones in setpiece/assets/",
+    )
     parser.add_argument("--folds", type=int, default=DEFAULTS["folds"])
     parser.add_argument("--epochs", type=int, default=DEFAULTS["epochs"])
     parser.add_argument("--hidden", type=int, default=DEFAULTS["hidden"])
@@ -1251,6 +1275,7 @@ def run_from_args(args: argparse.Namespace) -> int:
         limit=args.limit,
         metrics_path=metrics_path,
         quiet=getattr(args, "quiet", False),
+        install=getattr(args, "install", False),
     )
     return 0
 
