@@ -8,6 +8,7 @@ themselves when the featuriser or the smoke dataset is absent.
 
 from __future__ import annotations
 
+import json
 import math
 import time
 from pathlib import Path
@@ -318,6 +319,78 @@ def test_shot_model_returns_one_logit_per_graph(graphs: list[Data]) -> None:
     assert batched.shape == (3,)
     assert torch.isfinite(batched).all()
     assert float(batched[0]) == pytest.approx(float(single[0]), abs=1e-5)
+
+
+def test_shot_head_is_affine_in_the_pooled_readout() -> None:
+    """The shot head is one linear layer over the readout, deliberately.
+
+    A two-layer MLP there costs ~16k parameters that 677 positive corners cannot
+    pay for; dropping it is worth about +0.010 out-of-fold AUC. Test the property
+    rather than the type, so an equivalent rewrite still passes and a
+    reintroduced nonlinearity still fails: an affine map satisfies
+    ``f(a + b) - f(a) - f(b) + f(0) == 0`` and a ReLU stack does not.
+    """
+    model = shot_model()
+    width = model.readout.out_scale * model.encoder.hidden
+    gen = torch.Generator().manual_seed(7)
+    a = torch.randn(5, width, generator=gen)
+    b = torch.randn(5, width, generator=gen)
+    with torch.no_grad():
+        residual = (
+            model.shot_head(a + b)
+            - model.shot_head(a)
+            - model.shot_head(b)
+            + model.shot_head(torch.zeros(5, width))
+        )
+    assert torch.allclose(residual, torch.zeros_like(residual), atol=1e-5)
+
+
+def test_shot_head_choice_is_recorded_and_round_trips(tmp_path: Path) -> None:
+    """``head`` is part of the recipe, so a checkpoint rebuilds the head it trained."""
+    assert shot_model().init_kwargs["head"] == "linear"
+    legacy = shot_model(head="mlp")
+    assert legacy.init_kwargs["head"] == "mlp"
+
+    path = tmp_path / "legacy.pt"
+    save_model(legacy, path, _card())
+    loaded, _ = load_model(path)
+    assert isinstance(loaded, ShotModel)
+    assert loaded.head == "mlp"
+    data = make_data(14, 5)
+    with torch.no_grad():
+        assert float(loaded(data)[0]) == pytest.approx(float(legacy(data)[0]), abs=1e-6)
+
+
+def test_a_checkpoint_without_a_head_key_loads_as_the_old_mlp(tmp_path: Path) -> None:
+    """Checkpoints predating the ``head`` kwarg all hold the two-layer MLP head.
+
+    Rebuilding one with today's linear default would raise on the state dict, so
+    the loader has to date it by the missing key. Simulate that by stripping the
+    key from a freshly written checkpoint.
+    """
+    path = tmp_path / "old.pt"
+    save_model(shot_model(head="mlp"), path, _card())
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    kwargs = {k: v for k, v in json.loads(payload["kwargs_json"]).items() if k != "head"}
+    payload["kwargs_json"] = json.dumps(kwargs, sort_keys=True)
+    torch.save(payload, path)
+
+    loaded, _ = load_model(path)
+    assert loaded.head == "mlp"
+    with torch.no_grad():
+        assert torch.isfinite(loaded(make_data(12, 4))).all()
+
+
+def test_an_unknown_shot_head_is_rejected() -> None:
+    with pytest.raises(ValueError, match="unknown shot head"):
+        ShotModel(NODE_DIM, EDGE_DIM, head="transformer")
+
+
+def test_shot_head_is_smaller_than_the_receiver_head() -> None:
+    """The shot head carries no hidden layer, so it is the cheaper of the two."""
+    shot = count_parameters(shot_model())
+    receiver = count_parameters(receiver_model())
+    assert shot < receiver
 
 
 def test_shot_model_sees_the_defence() -> None:

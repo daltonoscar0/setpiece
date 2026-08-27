@@ -280,7 +280,54 @@ class ReceiverModel(nn.Module):
 
 
 class ShotModel(nn.Module):
-    """Binary head for ``shot_within_5``: one logit per graph."""
+    """Binary head for ``shot_within_5``: one logit per graph.
+
+    The readout feeds a **single linear layer**, not a two-layer MLP. That is a
+    measured choice, not a stylistic one. ``shot_within_5`` has a 0.275 base rate
+    over 2464 corners, so the head sees roughly 677 positives; a hidden layer on
+    top of a ``4 * hidden`` pooled vector adds ~16k parameters that the label
+    cannot pay for, and the extra capacity showed up as variance rather than
+    skill.
+
+    Selected on an inner protocol carved out of the training folds only — five
+    inner validation splits grouped by ``match_id``, five seeds, 25 fits per
+    configuration, never an outer test fold. Mean AUC over the inner validation
+    splits, and the spread across seeds:
+
+    ========================  =========  ===============
+    shot head                 inner AUC  across 5 seeds
+    ========================  =========  ===============
+    two-layer MLP (previous)  0.5629     0.5459 - 0.5782
+    single linear (this)      0.5741     0.5650 - 0.5831
+    ========================  =========  ===============
+
+    **The logistic-regression baseline still wins the shot head.** On the
+    reporting protocol — purged 5-fold by ``match_id``, pooled out-of-fold, the
+    identical rows — over four seeds at one thread:
+
+    ========================  ===============================  ======
+    shot head                 out-of-fold AUC per seed         mean
+    ========================  ===============================  ======
+    two-layer MLP (previous)  0.5569 0.5662 0.5688 0.5762      0.5670
+    single linear (this)      0.5735 0.5771 0.5801 0.5886      0.5798
+    logistic regression       0.5935 (deterministic)           0.5935
+    ========================  ===============================  ======
+
+    So the change buys the GNN +0.0128 AUC and closes about half of a 0.027
+    deficit; it does not overturn it. Nothing here licenses a claim that the GNN
+    predicts shots better than the pooled linear model.
+
+    The other measured effect is variance: the seed-to-seed spread of the inner
+    score drops from 0.032 to 0.018, which matters because these numbers are only
+    reproducible at a fixed thread count.
+
+    ``head`` selects between the two, and it is recorded in :attr:`init_kwargs`
+    so every checkpoint states which one it was trained with. Checkpoints written
+    before the head became configurable carry the MLP; see :func:`load_model`.
+    """
+
+    #: Readout-to-logit heads this class can build.
+    HEADS: tuple[str, ...] = ("linear", "mlp")
 
     def __init__(
         self,
@@ -290,17 +337,24 @@ class ShotModel(nn.Module):
         hidden: int = 64,
         layers: int = 3,
         dropout: float = 0.1,
+        head: str = "linear",
     ) -> None:
         super().__init__()
+        if head not in self.HEADS:
+            raise ValueError(f"unknown shot head {head!r}; expected one of {self.HEADS}")
         self.encoder = CornerEncoder(
             node_dim, edge_dim, hidden=hidden, layers=layers, dropout=dropout
         )
         self.readout = _GraphReadout()
-        self.shot_head = _mlp(self.readout.out_scale * hidden, hidden, 1, dropout)
+        self.head = head
+        width = self.readout.out_scale * hidden
+        self.shot_head: nn.Module = (
+            nn.Linear(width, 1) if head == "linear" else _mlp(width, hidden, 1, dropout)
+        )
 
     @property
     def init_kwargs(self) -> dict[str, Any]:
-        return dict(self.encoder.init_kwargs)
+        return {**self.encoder.init_kwargs, "head": self.head}
 
     def forward(self, data: Any) -> Tensor:
         """Return the shot logit ``[B]``."""
@@ -493,6 +547,12 @@ def load_model(path: str | Path) -> tuple[nn.Module, dict]:
 
     kwargs = json.loads(payload.get("kwargs_json", "{}"))
     card = json.loads(payload.get("card_json", "{}"))
+    if name == "ShotModel" and "head" not in kwargs:
+        # The shot head used to be a two-layer MLP and was not configurable, so
+        # it was not recorded either. Every checkpoint missing the key therefore
+        # holds the MLP head — the absence is what dates it, not a guess — and
+        # rebuilding it with today's default would fail on the state dict.
+        kwargs["head"] = "mlp"
     model = _REGISTRY[name](**kwargs)
     model.load_state_dict(payload["state_dict"])
     model.eval()

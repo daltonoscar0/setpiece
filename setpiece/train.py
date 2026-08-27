@@ -18,6 +18,19 @@ attacker who was not visible in the freeze frame, so there is no node to point
 at. Corners where the defence won first contact are **kept** — "the defence wins"
 is an explicit class of the receiver softmax, not a missing label.
 
+The whole protocol is run **once per seed and reported as a mean with a spread**.
+GNN training is only bit-reproducible at a fixed intra-op thread count (see
+:func:`set_seed`), so a single run quoted to three decimals invites the reader to
+believe a third-decimal difference. Each seed re-draws both the fold assignment
+and the network initialisation, so the spread covers the two things that would
+actually change on a re-run, and the deterministic baselines get a spread too —
+theirs comes purely from the split.
+
+Both binary probabilities — the shot sigmoid and the receiver head's
+"defence wins first contact" class — are checked against observed frequencies by
+:mod:`setpiece.calibration`, and the calibrator that ships in a checkpoint's card
+is fitted on out-of-fold predictions only.
+
 Freeze frames carry no velocities and nothing here invents any; every model card
 written from this module records ``assume_static: True``.
 """
@@ -41,7 +54,14 @@ from torch import Tensor, nn
 from torch_geometric.loader import DataLoader
 
 from setpiece import features as featmod
-from setpiece._io import read_corners
+from setpiece._io import RECEIVER_MATCH_MAX_M, read_corners
+from setpiece.calibration import (
+    Calibrator,
+    calibration_report,
+    expected_calibration_error,
+    fit_calibrator,
+    format_reliability_markdown,
+)
 from setpiece.models import (
     ReceiverModel,
     ShotModel,
@@ -53,17 +73,30 @@ from setpiece.types import GOAL_X, GOAL_Y, CornerFrame
 
 __all__ = [
     "DEFAULTS",
+    "LABEL_THRESHOLDS",
+    "CVResult",
     "Row",
     "add_train_arguments",
     "build_parser",
+    "cached_cross_validate",
+    "calibration_from_oof",
+    "cross_validate",
+    "label_threshold_sweep",
+    "load_oof",
     "load_rows",
     "main",
+    "metrics_from_oof",
+    "nested_calibration",
+    "oof_signature",
     "purged_fold_assignment",
     "receiver_metrics",
     "roc_auc",
     "run_from_args",
+    "save_oof",
+    "seed_list",
     "set_seed",
     "shot_metrics",
+    "summarise_seeds",
     "train_all",
 ]
 
@@ -81,7 +114,20 @@ DEFAULTS: dict[str, Any] = {
     "baseline_iters": 400,
     "baseline_lr": 0.05,
     "baseline_weight_decay": 1e-3,
+    "seeds": 5,
 }
+
+#: Seeds are spaced this far apart so that the per-fold seed of one repeat
+#: (``seed + fold``) can never collide with the per-fold seed of another. Two
+#: repeats sharing an initialisation would understate the spread they exist to
+#: measure.
+SEED_STRIDE: int = 1000
+
+#: Bin count for every reliability curve and calibration error quoted here.
+CALIBRATION_BINS: int = 10
+
+#: Calibrators tried on each binary head, in the order the table lists them.
+CALIBRATORS: tuple[str, ...] = ("platt", "isotonic")
 
 #: Softness of the nearest-to-goal heuristic, in metres. It only has to produce a
 #: monotone ranking; the temperature turns that ranking into a distribution so the
@@ -263,6 +309,12 @@ class Row:
     target_pos: int
     receiver_valid: bool
     y_shot: float
+    # Label provenance, carried for the threshold audit in ``analysis/``. These
+    # are label-adjacent diagnostics, never features: nothing downstream of
+    # ``build_graph`` sees them.
+    first_touch: str = "unknown"
+    receiver_match_dist: float | None = None
+    first_touch_dt: float | None = None
 
 
 def _pool(flat: np.ndarray, is_attacker: np.ndarray) -> np.ndarray:
@@ -330,6 +382,9 @@ def _row_from_frame(frame: CornerFrame) -> Row:
         target_pos=target_pos,
         receiver_valid=valid,
         y_shot=float(graph.y_shot.reshape(-1)[0].item()),
+        first_touch=str(frame.first_touch),
+        receiver_match_dist=frame.receiver_match_dist,
+        first_touch_dt=(frame.meta or {}).get("first_touch_dt"),
     )
 
 
@@ -751,6 +806,1017 @@ def _fit_receiver_logreg(
 
 
 # --------------------------------------------------------------------------- #
+# one cross-validation pass
+# --------------------------------------------------------------------------- #
+MODEL_KEYS: tuple[str, ...] = ("gnn", "logreg", "heuristic")
+
+
+@dataclass
+class CVResult:
+    """Pooled out-of-fold predictions from one purged cross-validation pass.
+
+    Every array is indexed by position in the ``rows`` list that produced it, and
+    **covers every row**, including the ones excluded from the receiver metrics.
+    Scoring a row is free once its fold model exists, and keeping the excluded
+    predictions is what makes the label-threshold audit possible without
+    retraining: a row dropped at 8 m is still a genuine out-of-fold prediction
+    from a model that never saw its match.
+    """
+
+    seed: int
+    assignment: np.ndarray
+    splits: dict[str, Any]
+    #: model -> per row, the probability of each candidate attacker.
+    cand_probs: dict[str, list[np.ndarray]]
+    #: model -> per row, P(defence wins first contact).
+    p_defence: dict[str, np.ndarray]
+    #: model -> per row, P(shot within five events).
+    shot: dict[str, np.ndarray]
+
+    def check(self, n_rows: int) -> None:
+        """Fail loudly on a hole. An unscored row must never reach a metric."""
+        for key in MODEL_KEYS:
+            if len(self.cand_probs[key]) != n_rows:
+                raise RuntimeError(
+                    f"{key} produced {len(self.cand_probs[key])} candidate distributions "
+                    f"for {n_rows} rows"
+                )
+            for name, arr in (("p_defence", self.p_defence[key]), ("shot", self.shot[key])):
+                if arr.shape != (n_rows,) or not bool(np.isfinite(arr).all()):
+                    raise RuntimeError(f"{key}/{name} is incomplete for {n_rows} rows")
+
+
+def _fit_fold_models(
+    train_rows: Sequence[Row], *, seed: int, hp: dict[str, Any]
+) -> tuple[ReceiverModel, ShotModel]:
+    """Both GNN heads on one training partition. Kept in one place so the
+    cross-validation loop and the nested-calibration loop cannot drift apart."""
+    kwargs = dict(
+        epochs=hp["epochs"],
+        hidden=hp["hidden"],
+        layers=hp["layers"],
+        dropout=hp["dropout"],
+        lr=hp["lr"],
+        weight_decay=hp["weight_decay"],
+        batch_size=hp["batch_size"],
+        seed=seed,
+    )
+    return _train_receiver(train_rows, **kwargs), _train_shot(train_rows, **kwargs)
+
+
+def cross_validate(
+    rows: Sequence[Row],
+    *,
+    folds: int,
+    seed: int,
+    hp: dict[str, Any],
+    log: Any = None,
+) -> CVResult:
+    """One purged group k-fold pass: train per fold, score the held-out rows.
+
+    ``seed`` drives the fold assignment *and* the initialisation, so repeating
+    this with a different seed re-draws both. The two baselines are fitted on the
+    identical training partition and scored on the identical held-out rows.
+    """
+    n = len(rows)
+    assignment = purged_fold_assignment([r.group for r in rows], folds, seed=seed)
+    n_folds = int(assignment.max()) + 1
+    result = CVResult(
+        seed=seed,
+        assignment=assignment,
+        splits=_split_summary(rows, assignment),
+        cand_probs={k: [np.zeros(0, dtype=np.float64)] * n for k in MODEL_KEYS},
+        p_defence={k: np.full(n, np.nan, dtype=np.float64) for k in MODEL_KEYS},
+        shot={k: np.full(n, np.nan, dtype=np.float64) for k in MODEL_KEYS},
+    )
+
+    for fold in range(n_folds):
+        test_idx = np.nonzero(assignment == fold)[0]
+        train_idx = np.nonzero(assignment != fold)[0]
+        train_rows = [rows[i] for i in train_idx]
+        test_rows = [rows[i] for i in test_idx]
+        if log is not None:
+            log(f"  seed {seed} fold {fold + 1}/{n_folds}: train {len(train_rows)}, "
+                f"test {len(test_rows)}")
+
+        receiver_model, shot_model = _fit_fold_models(train_rows, seed=seed + fold, hp=hp)
+
+        train_valid = [r for r in train_rows if r.receiver_valid]
+        prior = float(np.mean([r.target_pos < 0 for r in train_valid])) if train_valid else 0.5
+        shot_rate = float(np.mean([r.y_shot for r in train_rows])) if train_rows else 0.5
+        logreg_recv = _fit_receiver_logreg(
+            train_rows,
+            iters=hp["baseline_iters"],
+            lr=DEFAULTS["baseline_lr"],
+            weight_decay=DEFAULTS["baseline_weight_decay"],
+            seed=seed + fold,
+        )
+        logreg_shot = _fit_shot_logreg(
+            train_rows,
+            iters=hp["baseline_iters"],
+            lr=DEFAULTS["baseline_lr"],
+            weight_decay=DEFAULTS["baseline_weight_decay"],
+            seed=seed + fold,
+        )
+
+        preds: dict[str, tuple[list[np.ndarray], np.ndarray]] = {
+            "gnn": _predict_receiver_gnn(receiver_model, test_rows, hp["batch_size"]),
+            "heuristic": _heuristic_receiver(test_rows, prior),
+            "logreg": logreg_recv.predict(test_rows),
+        }
+        for name, (cand_probs, p_def) in preds.items():
+            # The table is only a comparison if all three models are scored on
+            # exactly these rows in exactly this order. A predictor returning a
+            # longer list would otherwise misalign silently and never raise.
+            if len(cand_probs) != len(test_idx) or len(p_def) != len(test_idx):
+                raise RuntimeError(
+                    f"{name} returned {len(cand_probs)} candidate distributions and "
+                    f"{len(p_def)} defence probabilities for {len(test_idx)} held-out "
+                    "rows; every model must be scored on the identical rows"
+                )
+            for slot, row_id in enumerate(test_idx):
+                result.cand_probs[name][int(row_id)] = np.asarray(
+                    cand_probs[slot], dtype=np.float64
+                )
+                result.p_defence[name][int(row_id)] = float(p_def[slot])
+
+        result.shot["gnn"][test_idx] = _predict_shot_gnn(shot_model, test_rows, hp["batch_size"])
+        result.shot["heuristic"][test_idx] = shot_rate
+        result.shot["logreg"][test_idx] = logreg_shot.predict(test_rows)
+
+    result.check(n)
+    return result
+
+
+def metrics_from_oof(
+    rows: Sequence[Row], cv: CVResult, *, keep: np.ndarray | None = None
+) -> dict[str, Any]:
+    """Receiver and shot tables from one pass of out-of-fold predictions.
+
+    ``keep`` optionally restricts the receiver tables to a boolean subset of the
+    rows — used by the label-threshold audit, which re-scores identical
+    predictions against a stricter definition of "this row has a usable receiver
+    label". The shot table always covers every row; the shot label has no such
+    threshold.
+    """
+    valid = np.asarray([r.receiver_valid for r in rows], dtype=bool)
+    if keep is not None:
+        valid = valid & np.asarray(keep, dtype=bool).reshape(-1)
+    ids = np.nonzero(valid)[0]
+    target_pos = np.asarray([rows[i].target_pos for i in ids], dtype=np.int64)
+
+    receiver: dict[str, Any] = {}
+    for name in MODEL_KEYS:
+        receiver[name] = receiver_metrics(
+            [cv.cand_probs[name][i] for i in ids],
+            cv.p_defence[name][ids],
+            target_pos,
+        )
+
+    n_cands = np.asarray([rows[i].cand_nodes.size for i in ids], dtype=np.float64)
+    attacker_first = target_pos >= 0
+    receiver["chance"] = {
+        "top1_attacker": float(np.mean(1.0 / n_cands[attacker_first]))
+        if attacker_first.any()
+        else float("nan"),
+        "top3_attacker": float(
+            np.mean(np.minimum(3.0, n_cands[attacker_first]) / n_cands[attacker_first])
+        )
+        if attacker_first.any()
+        else float("nan"),
+    }
+    receiver["always_defence_accuracy"] = (
+        float(np.mean(target_pos < 0)) if target_pos.size else float("nan")
+    )
+
+    y_shot = np.asarray([r.y_shot for r in rows], dtype=np.float64)
+    shot = {name: shot_metrics(y_shot, cv.shot[name]) for name in MODEL_KEYS}
+    return {"receiver": receiver, "shot": shot, "receiver_row_ids": ids}
+
+
+# --------------------------------------------------------------------------- #
+# repeated seeds
+# --------------------------------------------------------------------------- #
+def seed_list(seed: int, n_seeds: int) -> list[int]:
+    """``n_seeds`` well-separated seeds starting at ``seed``. See :data:`SEED_STRIDE`."""
+    if n_seeds < 1:
+        raise ValueError(f"n_seeds must be at least 1, got {n_seeds}")
+    return [seed + SEED_STRIDE * k for k in range(n_seeds)]
+
+
+def _aggregate(values: Sequence[float]) -> dict[str, Any]:
+    """Mean, spread and the raw repeats behind one number.
+
+    ``sd`` is the *sample* standard deviation (ddof=1) and is ``0.0`` for a
+    single repeat rather than ``nan``, because "we ran this once" is better said
+    by ``n`` than by a missing spread. Non-finite repeats are dropped, so a
+    metric that is undefined on one split does not poison the mean.
+    """
+    finite = [float(v) for v in values if v is not None and math.isfinite(float(v))]
+    if not finite:
+        return {"mean": float("nan"), "sd": float("nan"), "min": float("nan"),
+                "max": float("nan"), "n": 0, "values": []}
+    arr = np.asarray(finite, dtype=np.float64)
+    return {
+        "mean": float(arr.mean()),
+        "sd": float(arr.std(ddof=1)) if arr.size > 1 else 0.0,
+        "min": float(arr.min()),
+        "max": float(arr.max()),
+        "n": int(arr.size),
+        "values": [round(v, 6) for v in finite],
+    }
+
+
+def summarise_seeds(per_seed: Sequence[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Collapse one metrics dict per seed into ``(means, spread)``.
+
+    ``means`` has the shape of a single-seed report — every leaf a float — so
+    everything downstream that reads a metrics dict keeps working. ``spread``
+    mirrors it with ``{mean, sd, min, max, n, values}`` at each leaf.
+    """
+    means: dict[str, Any] = {}
+    spread: dict[str, Any] = {}
+    for family in ("receiver", "shot"):
+        means[family], spread[family] = {}, {}
+        for model in per_seed[0][family]:
+            entry = per_seed[0][family][model]
+            if not isinstance(entry, dict):  # always_defence_accuracy and friends
+                agg = _aggregate([s[family][model] for s in per_seed])
+                means[family][model] = agg["mean"]
+                spread[family][model] = agg
+                continue
+            means[family][model], spread[family][model] = {}, {}
+            for key in entry:
+                agg = _aggregate([s[family][model][key] for s in per_seed])
+                means[family][model][key] = agg["mean"]
+                spread[family][model][key] = agg
+    return means, spread
+
+
+def per_seed_summary(per_seed: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The headline figures of each repeat, small enough to sit in a model card.
+
+    :func:`metrics_from_oof` also returns ``receiver_row_ids``, an array as long
+    as the dataset; a card is a description, not a data dump, so only the numbers
+    a reader would compare across repeats come through.
+    """
+    out: list[dict[str, Any]] = []
+    for metrics in per_seed:
+        out.append(
+            {
+                "receiver": {
+                    model: {key: float(metrics["receiver"][model][key])
+                            for key in RECEIVER_METRIC_KEYS}
+                    for model in MODEL_KEYS
+                },
+                "shot": {
+                    model: float(metrics["shot"][model]["auc"]) for model in MODEL_KEYS
+                },
+            }
+        )
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# calibration
+# --------------------------------------------------------------------------- #
+def _binary_targets(rows: Sequence[Row]) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """The two genuinely binary labels, with the row mask each is defined on.
+
+    ``shot`` is defined on every row. ``defence`` — "the defence wins first
+    contact" — is only defined where the receiver label is usable, which is the
+    same subset the receiver table is scored on.
+    """
+    valid = np.asarray([r.receiver_valid for r in rows], dtype=bool)
+    return {
+        "shot": (
+            np.asarray([r.y_shot for r in rows], dtype=np.float64),
+            np.ones(len(rows), dtype=bool),
+        ),
+        "defence": (
+            np.asarray([r.target_pos < 0 for r in rows], dtype=np.float64),
+            valid,
+        ),
+    }
+
+
+def _head_scores(cv: CVResult, head: str, model: str) -> np.ndarray:
+    return cv.shot[model] if head == "shot" else cv.p_defence[model]
+
+
+def calibration_from_oof(
+    rows: Sequence[Row], cv: CVResult, *, bins: int = CALIBRATION_BINS
+) -> dict[str, Any]:
+    """Measure calibration of both binary heads on one pass of out-of-fold scores.
+
+    Reports the raw state of each head, then what each candidate calibrator would
+    do **fitted and evaluated on the same out-of-fold rows**. That in-sample view
+    is an optimistic bound, not an estimate of held-out calibration, and it is
+    labelled as such everywhere it is used; :func:`nested_calibration` is the
+    honest version. It is still worth having: if a calibrator cannot improve ECE
+    even when it is allowed to see the answers, it will certainly not improve it
+    out of sample.
+    """
+    targets = _binary_targets(rows)
+    out: dict[str, Any] = {}
+    for head, (y, mask) in targets.items():
+        out[head] = {}
+        for model in MODEL_KEYS:
+            p = _head_scores(cv, head, model)[mask]
+            entry: dict[str, Any] = {"raw": calibration_report(y[mask], p, bins=bins)}
+            for kind in CALIBRATORS:
+                cal = fit_calibrator(y[mask], p, kind=kind)
+                entry[kind] = {
+                    "in_sample": calibration_report(y[mask], cal.predict(p), bins=bins),
+                    "params": cal.to_dict(),
+                }
+            out[head][model] = entry
+    return out
+
+
+def nested_calibration(
+    rows: Sequence[Row],
+    cv: CVResult,
+    *,
+    hp: dict[str, Any],
+    kinds: Sequence[str] = CALIBRATORS,
+    log: Any = None,
+) -> dict[str, Any]:
+    """Held-out calibration error, with no held-out row ever seen by its calibrator.
+
+    Fitting a calibrator on the rows it is then scored on flatters it, and
+    fitting one on a model's *training* rows flatters it the other way: an
+    overfit model looks sharper in sample than it is, so the calibrator learns a
+    correction the held-out rows do not need. The only honest arrangement is a
+    second level of held-out data.
+
+    For each outer fold ``f`` this trains an extra pair of heads on
+    ``rows - (f + partner)``, scores its ``partner`` fold — rows that model never
+    saw and that do not overlap ``f`` — and fits the calibrator on those scores.
+    That calibrator is then applied to fold ``f``'s ordinary out-of-fold
+    predictions from ``cv``. Folds are paired (0,1), (2,3), … so one extra model
+    serves both members of a pair; with an odd fold count the last fold borrows
+    fold 0 as its partner. Five folds therefore cost three extra fits per head,
+    not five.
+
+    The one approximation left, stated rather than hidden: the calibrator is
+    fitted on scores from a model trained on three fifths of the data while it is
+    applied to a model trained on four fifths. A model trained on less data is
+    slightly less confident, so this is expected to *understate* how much
+    shrinking the shipped model needs.
+    """
+    n_folds = int(cv.assignment.max()) + 1
+    targets = _binary_targets(rows)
+    calibrated = {
+        head: {kind: np.full(len(rows), np.nan, dtype=np.float64) for kind in kinds}
+        for head in targets
+    }
+
+    pair_of: dict[int, int] = {}
+    for f in range(n_folds):
+        partner = f + 1 if f % 2 == 0 else f - 1
+        pair_of[f] = partner if partner < n_folds else 0
+    cache: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
+
+    for fold in range(n_folds):
+        partner = pair_of[fold]
+        key = (min(fold, partner), max(fold, partner))
+        if key not in cache:
+            if log is not None:
+                log(f"  nested calibration: extra fit excluding folds {key}")
+            held = np.isin(cv.assignment, key)
+            inner_train = [rows[i] for i in np.nonzero(~held)[0]]
+            recv_model, shot_model = _fit_fold_models(
+                inner_train, seed=cv.seed + 500 + key[0], hp=hp
+            )
+            p_shot = np.full(len(rows), np.nan, dtype=np.float64)
+            p_def = np.full(len(rows), np.nan, dtype=np.float64)
+            held_idx = np.nonzero(held)[0]
+            held_rows = [rows[i] for i in held_idx]
+            p_shot[held_idx] = _predict_shot_gnn(shot_model, held_rows, hp["batch_size"])
+            _, defence = _predict_receiver_gnn(recv_model, held_rows, hp["batch_size"])
+            p_def[held_idx] = defence
+            cache[key] = (p_shot, p_def)
+        p_shot, p_def = cache[key]
+
+        fit_on = cv.assignment == partner
+        apply_to = cv.assignment == fold
+        for head, (y, mask) in targets.items():
+            inner = np.asarray(p_shot if head == "shot" else p_def, dtype=np.float64)
+            fit_mask = fit_on & mask & np.isfinite(inner)
+            for kind in kinds:
+                cal = fit_calibrator(y[fit_mask], inner[fit_mask], kind=kind)
+                here = apply_to & mask
+                calibrated[head][kind][here] = cal.predict(_head_scores(cv, head, "gnn")[here])
+
+    out: dict[str, Any] = {}
+    for head, (y, mask) in targets.items():
+        raw = _head_scores(cv, head, "gnn")[mask]
+        out[head] = {
+            "raw_ece": expected_calibration_error(y[mask], raw, bins=CALIBRATION_BINS),
+            "raw_ece_quantile": expected_calibration_error(
+                y[mask], raw, bins=CALIBRATION_BINS, strategy="quantile"
+            ),
+        }
+        for kind in kinds:
+            p = calibrated[head][kind][mask]
+            if not bool(np.isfinite(p).all()):  # pragma: no cover - every fold is covered
+                raise RuntimeError(f"nested calibration left holes in {head}/{kind}")
+            out[head][kind] = {
+                "ece": expected_calibration_error(y[mask], p, bins=CALIBRATION_BINS),
+                "ece_quantile": expected_calibration_error(
+                    y[mask], p, bins=CALIBRATION_BINS, strategy="quantile"
+                ),
+                # Deliberately not called "auc". A single monotone calibrator
+                # cannot change a ranking, but this pooled column is *five
+                # different* per-fold maps stitched together, and two rows in
+                # different folds can swap order across the seam. The shipped
+                # calibrator is one global map and does preserve the AUC exactly;
+                # this number is the price of measuring calibration honestly, not
+                # a property of what ships.
+                "auc_pooled_per_fold_maps": roc_auc(y[mask], p),
+            }
+        out[head]["raw_auc"] = roc_auc(y[mask], raw)
+    return out
+
+
+def _pick_calibrator(nested: dict[str, Any], head: str) -> tuple[str, float, float]:
+    """The calibrator with the lowest honestly-measured ECE, and the two numbers.
+
+    Ties and near-ties go to the simpler map: isotonic has to beat Platt by more
+    than a tenth of the raw ECE to be worth its extra freedom on a few thousand
+    rows. If nothing beats the raw head, ``"identity"`` is returned and the
+    checkpoint ships uncalibrated.
+    """
+    raw = float(nested[head]["raw_ece"])
+    scores = {kind: float(nested[head][kind]["ece"]) for kind in CALIBRATORS}
+    kind = min(scores, key=lambda k: scores[k])
+    if kind == "isotonic" and "platt" in scores and scores["platt"] <= scores[kind] + 0.1 * raw:
+        kind = "platt"
+    if scores[kind] >= raw:
+        return "identity", raw, raw
+    return kind, raw, scores[kind]
+
+
+def fit_shipped_calibrators(
+    rows: Sequence[Row], cv: CVResult, nested: dict[str, Any]
+) -> dict[str, Any]:
+    """Fit the calibrators that travel in the checkpoints' model cards.
+
+    The *choice* of calibrator comes from :func:`nested_calibration`, which is the
+    only honest measurement of it. The calibrator that actually ships is then
+    refitted on the full pooled out-of-fold predictions, because the shipped
+    model is itself refitted on every corner and the pooled out-of-fold scores
+    are the largest set of honest predictions available for it. No held-out row
+    informs the number quoted for it; every corner informs the map that ships.
+    """
+    targets = _binary_targets(rows)
+    out: dict[str, Any] = {}
+    for head, (y, mask) in targets.items():
+        kind, raw_ece, nested_ece = _pick_calibrator(nested, head)
+        p = _head_scores(cv, head, "gnn")[mask]
+        cal: Calibrator = fit_calibrator(y[mask], p, kind=kind)
+        out[head] = {
+            "kind": kind,
+            "calibrator": cal.to_dict(),
+            "fitted_on": "pooled out-of-fold predictions, primary seed",
+            "ece_raw": raw_ece,
+            "ece_calibrated_nested": nested_ece,
+            "n_rows": int(mask.sum()),
+        }
+    return out
+
+
+def summarise_calibration(
+    in_sample: dict[str, Any], nested: dict[str, Any], shipped: dict[str, Any]
+) -> dict[str, Any]:
+    """One flat entry per head, joining the raw description to the nested result.
+
+    The descriptive numbers — how many rows, what the head actually predicted,
+    the raw reliability curve — come from the pooled out-of-fold predictions. The
+    *calibrated* ECE comes from :func:`nested_calibration`, because an ECE
+    measured on the rows the calibrator was fitted on is a lower bound rather
+    than a result.
+    """
+    out: dict[str, Any] = {}
+    for head, entry in shipped.items():
+        raw = in_sample[head]["gnn"]["raw"]
+        kind = entry["kind"]
+        n = nested[head]
+        out[head] = {
+            "n": raw["n"],
+            "base_rate": raw["base_rate"],
+            "mean_prediction": raw["mean_prediction"],
+            "min_prediction": raw["min_prediction"],
+            "max_prediction": raw["max_prediction"],
+            "brier_raw": raw["brier"],
+            "auc_raw": n["raw_auc"],
+            "ece_raw": n["raw_ece"],
+            "ece_raw_quantile": n["raw_ece_quantile"],
+            "ece_calibrated": n["raw_ece"] if kind == "identity" else n[kind]["ece"],
+            "ece_calibrated_quantile": (
+                n["raw_ece_quantile"] if kind == "identity" else n[kind]["ece_quantile"]
+            ),
+            "chosen": kind,
+            "curve": raw["curve"],
+        }
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# receiver-label threshold audit
+# --------------------------------------------------------------------------- #
+#: Match thresholds the receiver-label audit sweeps, in metres. ``None`` means
+#: "accept any match, however far". ``_io.RECEIVER_MATCH_MAX_M`` is 8.0 and is
+#: frozen; the sweep re-derives labels from the stored ``receiver_match_dist``
+#: rather than changing it.
+LABEL_THRESHOLDS: tuple[float | None, ...] = (4.0, 6.0, 8.0, 10.0, 12.0, None)
+
+
+def _threshold_masks(rows: Sequence[Row]) -> dict[str, np.ndarray]:
+    """The row masks the label audit works from."""
+    attacker = np.asarray([r.first_touch == "attacker" for r in rows], dtype=bool)
+    valid = np.asarray([r.receiver_valid for r in rows], dtype=bool)
+    dist = np.asarray(
+        [np.nan if r.receiver_match_dist is None else float(r.receiver_match_dist)
+         for r in rows],
+        dtype=np.float64,
+    )
+    return {
+        "attacker": attacker,
+        "valid": valid,
+        "dist": dist,
+        # A match exists (some candidate attacker was nearest to the touch), at
+        # whatever distance. Attacker-first rows without one have no visible
+        # candidate at all and can never be labelled.
+        "has_match": attacker & np.isfinite(dist),
+        "defence": valid & ~attacker,
+    }
+
+
+def _bracket(correct: float, kept: int, added: int) -> tuple[float, float]:
+    """The range a rate could take once ``added`` unscoreable rows are included.
+
+    Low assumes every added row is wrong, high assumes every one is right. There
+    is no way to narrow this from the shipped dataset — see
+    :func:`label_threshold_sweep`.
+    """
+    total = kept + added
+    if total == 0:
+        return float("nan"), float("nan")
+    return correct / total, (correct + added) / total
+
+
+def label_threshold_sweep(
+    rows: Sequence[Row],
+    cvs: Sequence[CVResult],
+    *,
+    thresholds: Sequence[float | None] = LABEL_THRESHOLDS,
+    shipped: float = RECEIVER_MATCH_MAX_M,
+) -> dict[str, Any]:
+    """How the receiver metrics move with the receiver-label match threshold.
+
+    ``_io.RECEIVER_MATCH_MAX_M = 8.0`` decides which attacker-first corners get a
+    receiver label: the first touch is matched to the nearest candidate attacker
+    in the freeze frame, and the row is kept only if that nearest candidate is
+    within the threshold. It is a judgement call, so this re-derives the labels at
+    other thresholds from the ``receiver_match_dist`` the dataset stores for
+    exactly this purpose, and re-scores the *same* out-of-fold predictions.
+
+    Nothing is retrained. Only the evaluation subset moves, so this measures the
+    sensitivity of the reported numbers to the threshold, not the sensitivity of
+    the fitted models to it. Retraining at each threshold would change the
+    training rows too and is a larger experiment than the question asks for.
+
+    **Above 8 m the numbers can only be bracketed, and that is a property of the
+    dataset rather than a shortcut.** ``_io`` drops ``receiver_idx`` when the
+    match exceeds its own threshold and keeps only the distance, so for a row
+    matched at 11 m the dataset records that a match existed and how far away it
+    was, but not *which* attacker it was. The label can therefore be tightened
+    from the shipped file and only loosened by re-fetching the events. Rows added
+    above 8 m are reported as a range: every one wrong at the low end, every one
+    right at the high end.
+
+    Averaged over ``cvs`` — one entry per seed — so a threshold row carries the
+    same kind of spread as the main table.
+    """
+    masks = _threshold_masks(rows)
+    dist, attacker, defence = masks["dist"], masks["attacker"], masks["defence"]
+    has_match = masks["has_match"]
+    n_defence = int(defence.sum())
+    n_matched_shipped = int((has_match & (dist <= shipped)).sum())
+
+    entries: list[dict[str, Any]] = []
+    base: dict[str, dict[str, Any]] | None = None
+    for t in thresholds:
+        kept_attacker = has_match if t is None else (has_match & (dist <= float(t)))
+        n_attacker = int(kept_attacker.sum())
+        entry: dict[str, Any] = {
+            "threshold": t,
+            "n_attacker_first": n_attacker,
+            "n_defence": n_defence,
+            "n_rows": n_attacker + n_defence,
+            "attacker_share_kept": (
+                n_attacker / int(has_match.sum()) if has_match.any() else float("nan")
+            ),
+            "scoreable": t is not None and float(t) <= shipped,
+        }
+        if entry["scoreable"]:
+            keep = defence | kept_attacker
+            per_seed = [metrics_from_oof(rows, cv, keep=keep)["receiver"] for cv in cvs]
+            entry["metrics"] = {
+                model: {
+                    key: _aggregate([m[model][key] for m in per_seed])
+                    for key in RECEIVER_METRIC_KEYS
+                }
+                for model in MODEL_KEYS
+            }
+            if t is not None and float(t) == shipped:
+                base = entry["metrics"]
+        entries.append(entry)
+
+    # Bracket the thresholds whose labels the shipped dataset cannot reconstruct.
+    for entry in entries:
+        if entry["scoreable"] or base is None:
+            continue
+        added = entry["n_attacker_first"] - n_matched_shipped
+        entry["added_rows"] = added
+        entry["bounds"] = {
+            model: {
+                "top1_attacker": _bracket(
+                    base[model]["top1_attacker"]["mean"] * n_matched_shipped,
+                    n_matched_shipped,
+                    added,
+                ),
+                "top3_attacker": _bracket(
+                    base[model]["top3_attacker"]["mean"] * n_matched_shipped,
+                    n_matched_shipped,
+                    added,
+                ),
+                "overall_accuracy": _bracket(
+                    base[model]["overall_accuracy"]["mean"]
+                    * (n_matched_shipped + n_defence),
+                    n_matched_shipped + n_defence,
+                    added,
+                ),
+            }
+            for model in MODEL_KEYS
+        }
+
+    finite = dist[np.isfinite(dist)]
+    quantiles = (
+        {
+            str(q): float(np.quantile(finite, q))
+            for q in (0.5, 0.75, 0.9, 0.95, 0.99)
+        }
+        if finite.size
+        else {}
+    )
+    return {
+        "shipped_threshold": shipped,
+        "entries": entries,
+        "n_attacker_first": int(attacker.sum()),
+        "n_with_match": int(has_match.sum()),
+        "match_distance_quantiles": quantiles,
+        "n_seeds": len(cvs),
+        "summary": _threshold_summary(entries, quantiles, shipped, n_matched_shipped),
+        "table": _threshold_tables(entries, shipped),
+        "notes": _threshold_notes(entries, shipped, len(cvs)),
+    }
+
+
+def _threshold_summary(
+    entries: Sequence[dict[str, Any]],
+    quantiles: dict[str, float],
+    shipped: float,
+    n_matched_shipped: int,
+) -> str:
+    at = {e["threshold"]: e for e in entries}
+    unlimited = at.get(None)
+    tight = next((e for e in entries if e["scoreable"] and e["threshold"] == 4.0), None)
+    base = at.get(shipped)
+    parts = [
+        f"`RECEIVER_MATCH_MAX_M = {shipped}` in the frozen `setpiece/_io.py` decides which "
+        "attacker-first corners get a receiver label at all: the first touch is matched to "
+        "the nearest candidate attacker in the freeze frame and the row survives only if that "
+        "candidate is within the threshold. It was a judgement call and had never been "
+        "checked, so the labels here are re-derived at other thresholds from the "
+        "`receiver_match_dist` the dataset stores for exactly this purpose, and the *same* "
+        "out-of-fold predictions are re-scored against them. Nothing is retrained: this "
+        "measures how sensitive the reported numbers are to the threshold, not how sensitive "
+        "a refitted model would be."
+    ]
+    if quantiles:
+        parts.append(
+            "Match distances are short where they are usable at all — median "
+            f"{quantiles['0.5']:.2f} m, 75th percentile {quantiles['0.75']:.2f} m, 90th "
+            f"{quantiles['0.9']:.2f} m, 95th {quantiles['0.95']:.2f} m — so the threshold "
+            "sits far out in the tail rather than through the middle of the distribution."
+        )
+    if unlimited is not None and base is not None:
+        extra = unlimited["n_attacker_first"] - n_matched_shipped
+        parts.append(
+            f"Dropping the threshold entirely would add {_plural(extra, 'attacker-first row')} "
+            f"to the {n_matched_shipped} that survive at {shipped:g} m "
+            f"({extra / max(unlimited['n_attacker_first'], 1):.1%} of every attacker-first "
+            "corner with a match), and each of those is a corner whose *nearest visible "
+            f"attacker* was more than {shipped:g} m from where the ball was actually touched. "
+            "That is not a receiver who happened to be mislocated; it is the closest thing on "
+            "camera to an event whose real actor the frame does not show."
+        )
+    if tight is not None and base is not None:
+        cost = base["n_attacker_first"] - tight["n_attacker_first"]
+        moves = [
+            f"{MODEL_LABELS[k]} {delta:+.3f}"
+            for k in MODEL_ORDER
+            for delta in [
+                tight["metrics"][k]["top1_attacker"]["mean"]
+                - base["metrics"][k]["top1_attacker"]["mean"]
+            ]
+        ]
+        parts.append(
+            f"Tightening to 4 m costs {_plural(cost, 'attacker-first row')}, leaving "
+            f"{tight['n_attacker_first']}, and moves top-1 by "
+            + ", ".join(moves[:-1])
+            + f" and {moves[-1]}."
+        )
+    return " ".join(parts)
+
+
+def _range_cell(low: float, high: float) -> str:
+    if math.isnan(low) or math.isnan(high):
+        return "n/a"
+    # A threshold that adds no rows collapses the bracket; print it as the number
+    # it is rather than as a range from a value to itself.
+    if abs(high - low) < 5e-4:
+        return f"{low:.3f}"
+    return f"{low:.3f}-{high:.3f}"
+
+
+def _plural(n: int, singular: str, plural: str | None = None) -> str:
+    return f"{n} {singular}" if n == 1 else f"{n} {plural or singular + 's'}"
+
+
+def _threshold_label(t: float | None) -> str:
+    return "unthresholded" if t is None else f"{t:g} m"
+
+
+def _threshold_tables(entries: Sequence[dict[str, Any]], shipped: float) -> str:
+    lines = [
+        "| threshold | corners with a usable label | attacker-first among them | "
+        "share of matchable attacker-first rows kept |",
+        "|---|---|---|---|",
+    ]
+    for e in entries:
+        mark = " *(shipped)*" if e["threshold"] == shipped else ""
+        lines.append(
+            f"| {_threshold_label(e['threshold'])}{mark} | {e['n_rows']} | "
+            f"{e['n_attacker_first']} | {e['attacker_share_kept']:.3f} |"
+        )
+    lines.append("")
+    lines.append(
+        "| threshold | GNN top-1 | logreg top-1 | heuristic top-1 | GNN top-3 | "
+        "logreg top-3 | heuristic top-3 | GNN overall acc. |"
+    )
+    lines.append("|---|---|---|---|---|---|---|---|")
+    for e in entries:
+        mark = " *(shipped)*" if e["threshold"] == shipped else ""
+        if e["scoreable"]:
+            m = e["metrics"]
+            cells = [
+                f"{m[k]['top1_attacker']['mean']:.3f} ±{m[k]['top1_attacker']['sd']:.3f}"
+                for k in MODEL_ORDER
+            ] + [
+                f"{m[k]['top3_attacker']['mean']:.3f} ±{m[k]['top3_attacker']['sd']:.3f}"
+                for k in MODEL_ORDER
+            ] + [
+                f"{m['gnn']['overall_accuracy']['mean']:.3f} "
+                f"±{m['gnn']['overall_accuracy']['sd']:.3f}"
+            ]
+        elif "bounds" in e:
+            b = e["bounds"]
+            cells = [_range_cell(*b[k]["top1_attacker"]) for k in MODEL_ORDER]
+            cells += [_range_cell(*b[k]["top3_attacker"]) for k in MODEL_ORDER]
+            cells += [_range_cell(*b["gnn"]["overall_accuracy"])]
+        else:  # pragma: no cover - only when 8 m itself was not swept
+            cells = ["n/a"] * 7
+        lines.append(f"| {_threshold_label(e['threshold'])}{mark} | " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
+def _threshold_notes(
+    entries: Sequence[dict[str, Any]], shipped: float, n_seeds: int
+) -> list[str]:
+    notes = [
+        f"Every cell is a mean ±sd over the same {n_seeds} repeats as the main table, "
+        "re-scoring stored out-of-fold predictions. The models are the ones trained under "
+        f"the shipped {shipped:g} m labels throughout; only the rows they are scored on "
+        "change.",
+        "Rows above the shipped threshold are given as a **range, not an estimate**. "
+        "`setpiece/_io.py` keeps `receiver_match_dist` but drops `receiver_idx` once the "
+        "match exceeds its own threshold, so for a corner matched at 11 m the dataset "
+        "records that a match existed and how far it was, but not which attacker it was. "
+        "The range is every added row wrong at the low end and every added row right at the "
+        "high end. Loosening the threshold for real needs a re-fetch, not a re-read.",
+        "The defence-wins AUC is not swept: loosening the threshold changes the negative "
+        "class of that binary problem as well as its size, so a bracket on it would be "
+        "vacuous rather than informative.",
+    ]
+    scoreable = [e for e in entries if e["scoreable"]]
+    if len(scoreable) > 1:
+        keys = ("top1_attacker", "top3_attacker")
+        gaps = [
+            max(e["metrics"][k][key]["mean"] for e in scoreable)
+            - min(e["metrics"][k][key]["mean"] for e in scoreable)
+            for k in MODEL_KEYS
+            for key in keys
+        ]
+        # One distinct ordering per metric means the ranking never changed. A
+        # metric that reorders the models contributes two or more.
+        pretty = {"top1_attacker": "top-1", "top3_attacker": "top-3"}
+        reorders = [
+            pretty[key]
+            for key in keys
+            if len(
+                {
+                    tuple(sorted(MODEL_KEYS, key=lambda k: -e["metrics"][k][key]["mean"]))
+                    for e in scoreable
+                }
+            )
+            > 1
+        ]
+        labels = ", ".join(_threshold_label(e["threshold"]) for e in scoreable)
+        note = (
+            f"Across {labels} no model's top-1 or top-3 moves by more than {max(gaps):.3f} "
+            "from end to end, so the headline receiver comparison does not rest on the "
+            "threshold. "
+        )
+        if reorders:
+            note += (
+                "The model ranking is not quite fixed, though: "
+                + " and ".join(reorders)
+                + " reorders somewhere in that range, by a margin smaller than the spread "
+                "beside it — which is a statement about how close the GNN and the logistic "
+                "regression are, not about the threshold."
+            )
+        else:
+            note += "The ranking of the three models is identical at every threshold."
+        notes.append(note)
+    return notes
+
+
+# --------------------------------------------------------------------------- #
+# out-of-fold predictions on disk
+# --------------------------------------------------------------------------- #
+def oof_signature(
+    rows: Sequence[Row], dataset_path: str | Path, folds: int, hp: dict[str, Any]
+) -> str:
+    """A string identifying what a cached out-of-fold pass was computed from.
+
+    Cached predictions are only reusable if the rows, the fold count, the feature
+    layout and every hyperparameter that touches training are unchanged. Storing
+    the signature next to the arrays turns "is this cache stale?" from a judgement
+    call into an equality test, so a stale cache raises instead of quietly
+    reporting numbers from a configuration nobody is running any more.
+    """
+    keys = ("epochs", "hidden", "layers", "dropout", "lr", "weight_decay",
+            "batch_size", "baseline_iters", "baseline_lr", "baseline_weight_decay")
+    return json.dumps(
+        {
+            "dataset": str(dataset_path),
+            "n_rows": len(rows),
+            "folds": int(folds),
+            "n_node_features": int(featmod.N_NODE_FEATURES),
+            "n_edge_features": int(featmod.N_EDGE_FEATURES),
+            "shot_head": ShotModel(
+                featmod.N_NODE_FEATURES, featmod.N_EDGE_FEATURES, hidden=1, layers=1
+            ).head,
+            "hp": {k: hp[k] for k in keys if k in hp},
+        },
+        sort_keys=True,
+    )
+
+
+def save_oof(
+    rows: Sequence[Row], cv: CVResult, path: str | Path, *, signature: str = ""
+) -> Path:
+    """Write one pass of out-of-fold predictions to ``.npz``.
+
+    Ragged per-row candidate distributions are stored flat with an offset array.
+    The row-level label columns travel with them so an audit script — the
+    label-threshold sweep in ``analysis/`` — can re-score these predictions
+    against a different definition of a usable label without retraining anything.
+
+    ``signature`` is stored verbatim and checked by :func:`load_oof`.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lengths = np.asarray([r.cand_nodes.size for r in rows], dtype=np.int64)
+    payload: dict[str, Any] = {
+        "seed": np.asarray(cv.seed),
+        "signature": np.asarray(signature),
+        "splits_json": np.asarray(json.dumps(cv.splits, default=str)),
+        "assignment": cv.assignment,
+        "cand_offsets": np.concatenate([[0], np.cumsum(lengths)]),
+        "target_pos": np.asarray([r.target_pos for r in rows], dtype=np.int64),
+        "receiver_valid": np.asarray([r.receiver_valid for r in rows], dtype=bool),
+        "y_shot": np.asarray([r.y_shot for r in rows], dtype=np.float64),
+        "n_candidates": lengths,
+        "match_dist": np.asarray(
+            [np.nan if r.receiver_match_dist is None else r.receiver_match_dist for r in rows],
+            dtype=np.float64,
+        ),
+        "first_touch_dt": np.asarray(
+            [np.nan if r.first_touch_dt is None else r.first_touch_dt for r in rows],
+            dtype=np.float64,
+        ),
+        "attacker_first": np.asarray([r.first_touch == "attacker" for r in rows], dtype=bool),
+    }
+    for key in MODEL_KEYS:
+        payload[f"cand_{key}"] = (
+            np.concatenate([np.asarray(c, dtype=np.float64) for c in cv.cand_probs[key]])
+            if rows
+            else np.zeros(0, dtype=np.float64)
+        )
+        payload[f"defence_{key}"] = cv.p_defence[key]
+        payload[f"shot_{key}"] = cv.shot[key]
+    np.savez_compressed(path, **payload)
+    return path
+
+
+def load_oof(path: str | Path, *, signature: str | None = None) -> CVResult:
+    """Rebuild a :class:`CVResult` written by :func:`save_oof`.
+
+    With ``signature``, a cache written from a different dataset, fold count or
+    hyperparameter set raises instead of being reused. A silent mismatch here
+    would put numbers from an abandoned configuration into `docs/metrics.md`, so
+    it is an error rather than a warning.
+    """
+    with np.load(Path(path), allow_pickle=False) as data:
+        stored = str(data["signature"]) if "signature" in data else ""
+        if signature is not None and stored != signature:
+            raise ValueError(
+                f"cached out-of-fold predictions at {path} were computed from a "
+                f"different configuration:\n  cached: {stored}\n  wanted: {signature}"
+            )
+        offsets = data["cand_offsets"]
+        cand: dict[str, list[np.ndarray]] = {}
+        p_def: dict[str, np.ndarray] = {}
+        shot: dict[str, np.ndarray] = {}
+        for key in MODEL_KEYS:
+            flat = data[f"cand_{key}"]
+            cand[key] = [
+                np.asarray(flat[offsets[i]:offsets[i + 1]], dtype=np.float64)
+                for i in range(len(offsets) - 1)
+            ]
+            p_def[key] = np.asarray(data[f"defence_{key}"], dtype=np.float64)
+            shot[key] = np.asarray(data[f"shot_{key}"], dtype=np.float64)
+        return CVResult(
+            seed=int(data["seed"]),
+            assignment=np.asarray(data["assignment"], dtype=np.int64),
+            splits=json.loads(str(data["splits_json"])) if "splits_json" in data else {},
+            cand_probs=cand,
+            p_defence=p_def,
+            shot=shot,
+        )
+
+
+def cached_cross_validate(
+    rows: Sequence[Row],
+    *,
+    dataset_path: str | Path,
+    folds: int,
+    seed: int,
+    hp: dict[str, Any],
+    cache_dir: str | Path | None = None,
+    log: Any = None,
+) -> CVResult:
+    """:func:`cross_validate`, reusing a cached pass when one matches.
+
+    A full pass costs five fits per head, and the report is regenerated far more
+    often than the predictions change. With ``cache_dir`` each seed's pass is
+    written to ``oof-seed<seed>.npz`` under a signature, so re-running the report
+    — or computing the seeds in parallel processes and then collecting them — is
+    free. Without it, nothing is cached and nothing is written.
+    """
+    if cache_dir is None:
+        return cross_validate(rows, folds=folds, seed=seed, hp=hp, log=log)
+    signature = oof_signature(rows, dataset_path, folds, hp)
+    path = Path(cache_dir) / f"oof-seed{seed}.npz"
+    if path.exists():
+        cv = load_oof(path, signature=signature)
+        cv.check(len(rows))
+        if log is not None:
+            log(f"  seed {seed}: reused cached out-of-fold predictions from {path}")
+        return cv
+    cv = cross_validate(rows, folds=folds, seed=seed, hp=hp, log=log)
+    save_oof(rows, cv, path, signature=signature)
+    if log is not None:
+        log(f"  seed {seed}: wrote {path}")
+    return cv
+
+
+# --------------------------------------------------------------------------- #
 # markdown reporting
 # --------------------------------------------------------------------------- #
 def _fmt(value: float) -> str:
@@ -786,6 +1852,71 @@ MODEL_LABELS: dict[str, str] = {
 }
 MODEL_ORDER: tuple[str, ...] = ("gnn", "logreg", "heuristic")
 
+#: A gap has to be this many times the spread of its own paired difference before
+#: the table calls it real. Two is deliberately modest — it is a readability rule
+#: for a five-repeat sample, not a significance test.
+DECISIVE_RATIO: float = 2.0
+
+
+def _agg(report: dict[str, Any], family: str, model: str, key: str) -> dict[str, Any]:
+    """The spread entry behind one cell, or a degenerate one if none was recorded."""
+    try:
+        return report["spread"][family][model][key]
+    except (KeyError, TypeError):
+        value = float(report[family][model][key])
+        return {"mean": value, "sd": 0.0, "min": value, "max": value, "n": 1, "values": [value]}
+
+
+def _cell(report: dict[str, Any], family: str, model: str, key: str) -> str:
+    """``mean ±sd`` across repeats, or a bare mean when there was only one."""
+    agg = _agg(report, family, model, key)
+    if agg["n"] == 0 or math.isnan(agg["mean"]):
+        return "n/a"
+    if agg["n"] < 2:
+        return f"{agg['mean']:.3f}"
+    return f"{agg['mean']:.3f} ±{agg['sd']:.3f}"
+
+
+def _paired_gap(
+    report: dict[str, Any], family: str, key: str, challenger: str, incumbent: str
+) -> dict[str, Any] | None:
+    """``challenger - incumbent`` seed by seed: the mean gap and its own spread.
+
+    Both models see the identical split within a seed, so differencing them
+    inside a seed cancels the split noise that dominates the individual columns.
+    A gap is only worth reporting as a result if it is large against the spread
+    of *this* difference, which is usually much tighter than the spread of either
+    column on its own.
+    """
+    a = _agg(report, family, key=key, model=challenger)
+    b = _agg(report, family, key=key, model=incumbent)
+    if a["n"] < 1 or a["n"] != b["n"]:
+        return None
+    diffs = np.asarray(a["values"], dtype=np.float64) - np.asarray(b["values"], dtype=np.float64)
+    if diffs.size == 0:
+        return None
+    sd = float(diffs.std(ddof=1)) if diffs.size > 1 else 0.0
+    mean = float(diffs.mean())
+    ratio = abs(mean) / sd if sd > 0 else float("inf")
+    return {"mean": mean, "sd": sd, "n": int(diffs.size), "ratio": ratio}
+
+
+def _describe_gap(gap: dict[str, Any] | None, winner: str, loser: str, pretty: str) -> str:
+    if gap is None or gap["n"] < 2:
+        return ""
+    if math.isinf(gap["ratio"]):
+        return " Every repeat agreed, so the sign of this gap is not in doubt."
+    verdict = (
+        "clear of the noise floor"
+        if gap["ratio"] >= DECISIVE_RATIO
+        else "**inside the noise floor** and should not be leaned on"
+    )
+    return (
+        f" Seed by seed, {winner} minus {loser} on {pretty} is "
+        f"{abs(gap['mean']):.3f} ±{gap['sd']:.3f} over {gap['n']} repeats — "
+        f"{gap['ratio']:.1f}x its own spread, {verdict}."
+    )
+
 
 def format_metrics_markdown(report: dict[str, Any]) -> str:
     """Render the full metrics report as markdown."""
@@ -818,6 +1949,30 @@ def format_metrics_markdown(report: dict[str, Any]) -> str:
         f"{splits['matches_per_fold']}."
     )
     lines.append("")
+    seeds = report.get("seeds") or [report.get("training", {}).get("seed", 0)]
+    threads = report.get("training", {}).get("torch_threads")
+    if len(seeds) > 1:
+        lines.append(
+            f"**Every figure is a mean over {len(seeds)} repeats of the whole protocol, "
+            "written `mean ±sd`** with the sample standard deviation across those repeats. "
+            f"Seeds {seeds} each re-draw the fold assignment *and* the network "
+            "initialisation, so the spread covers both of the things that change on a "
+            "re-run. The two baselines are deterministic given a split, so their spread is "
+            "pure split noise; the GNN's carries initialisation noise on top. A difference "
+            "smaller than the spread beside it is not a result. Where two models are "
+            "compared below, the gap is differenced *within* each repeat first, which "
+            "cancels the shared split noise and is a tighter test than eyeballing two "
+            "columns."
+        )
+        lines.append("")
+    if threads is not None:
+        lines.append(
+            f"Run at `torch.set_num_threads({threads})`. That is not decoration: torch's "
+            "parallel reductions sum in thread-partition order, so the GNN column is only "
+            "reproducible at a pinned thread count, and every checkpoint's card records the "
+            "count it was trained at."
+        )
+        lines.append("")
     if splits.get("n_ungrouped_corners"):
         lines.append(
             f"**Caveat:** {splits['n_ungrouped_corners']} of these corners carry no "
@@ -858,11 +2013,8 @@ def format_metrics_markdown(report: dict[str, Any]) -> str:
     )
     lines.append("|---|---|---|---|---|")
     for key in MODEL_ORDER:
-        m = receiver[key]
-        lines.append(
-            f"| {MODEL_LABELS[key]} | {_fmt(m['top1_attacker'])} | {_fmt(m['top3_attacker'])} "
-            f"| {_fmt(m['overall_accuracy'])} | {_fmt(m['defence_auc'])} |"
-        )
+        cells = " | ".join(_cell(report, "receiver", key, k) for k in RECEIVER_METRIC_KEYS)
+        lines.append(f"| {MODEL_LABELS[key]} | {cells} |")
     lines.append("")
     lines.append(
         f"Chance level over the candidates is {_fmt(receiver['chance']['top1_attacker'])} "
@@ -889,38 +2041,205 @@ def format_metrics_markdown(report: dict[str, Any]) -> str:
     lines.append("| model | AUC |")
     lines.append("|---|---|")
     for key in MODEL_ORDER:
-        lines.append(f"| {MODEL_LABELS[key]} | {_fmt(shot[key]['auc'])} |")
+        lines.append(f"| {MODEL_LABELS[key]} | {_cell(report, 'shot', key, 'auc')} |")
     lines.append("")
 
     lines.append("## reading")
     lines.append("")
-    for label, table, key, pretty in (
-        ("receiver top-1", receiver, "top1_attacker", "top-1 on the attacker-first subset"),
-        ("receiver defence AUC", receiver, "defence_auc", "AUC for the defence-wins class"),
-        ("shot", shot, "auc", "shot AUC"),
+    for family, key, pretty in (
+        ("receiver", "top1_attacker", "top-1 on the attacker-first subset"),
+        ("receiver", "top3_attacker", "top-3 on the attacker-first subset"),
+        ("receiver", "defence_auc", "AUC for the defence-wins class"),
+        ("shot", "auc", "shot AUC"),
     ):
+        table = report[family]
         subset = {k: table[k] for k in MODEL_ORDER if k in table}
         winners, value = _better(subset, key)
         if not winners:
-            lines.append(f"- {label}: undefined on this data.")
+            lines.append(f"- {pretty.capitalize()}: undefined on this data.")
             continue
         gnn_value = subset["gnn"].get(key, float("nan"))
         if len(winners) > 1:
             names = ", ".join(MODEL_LABELS[w] for w in winners)
             lines.append(f"- {pretty.capitalize()}: {names} tie at {_fmt(value)}.")
-        elif winners[0] == "gnn":
-            lines.append(f"- The GNN wins on {pretty} ({_fmt(value)}).")
+            continue
+        runner_up = max(
+            (k for k in MODEL_ORDER if k != winners[0] and k in subset),
+            key=lambda k: subset[k].get(key, float("-inf")),
+        )
+        gap = _paired_gap(report, family, key, winners[0], runner_up)
+        if winners[0] == "gnn":
+            lines.append(
+                f"- The GNN wins on {pretty} ({_fmt(value)}), ahead of the "
+                f"{MODEL_LABELS[runner_up]} at {_fmt(subset[runner_up].get(key, float('nan')))}."
+                + _describe_gap(gap, "the GNN", f"the {MODEL_LABELS[runner_up]}", pretty)
+            )
         else:
             lines.append(
                 f"- The {MODEL_LABELS[winners[0]]} baseline **beats** the GNN on {pretty}: "
                 f"{_fmt(value)} against {_fmt(gnn_value)}."
+                + _describe_gap(
+                    _paired_gap(report, family, key, winners[0], "gnn"),
+                    f"the {MODEL_LABELS[winners[0]]}",
+                    "the GNN",
+                    pretty,
+                )
             )
     lines.append("")
     lines.append(
         f"Parameters: receiver {params['receiver']:,}, shot {params['shot']:,}."
     )
     lines.append("")
+
+    lines.extend(_calibration_section(report))
+    lines.extend(_threshold_section(report))
     return "\n".join(lines)
+
+
+def _calibration_section(report: dict[str, Any]) -> list[str]:
+    """The calibration part of the table, or a line saying it was not measured."""
+    cal = report.get("calibration")
+    if not cal:
+        return []
+    lines = ["## calibration", ""]
+    lines.append(
+        "Two of the numbers this project emits are genuine binary probabilities and can be "
+        "checked against observed frequencies: the shot head's sigmoid, and the receiver "
+        "head's `P(defence wins first contact)`. The per-attacker receiver probabilities are "
+        "not in that family — they are a distribution over a variable-length candidate set — "
+        "so they are ranked, not calibrated. Expected calibration error (ECE) below is the "
+        "count-weighted mean gap between predicted and observed frequency over "
+        f"{CALIBRATION_BINS} bins of the pooled out-of-fold predictions, reported under both "
+        "binnings: equal-width bins are the textbook definition, and equal-count bins are the "
+        "honest view for a head whose predictions all sit inside a narrow band, where "
+        "equal-width bins drop every row into two buckets and report a flatteringly small "
+        "number. Calibration is a monotone rescaling, so **every AUC above is identical "
+        "before and after it**: this section changes what a number means, never how well it "
+        "ranks."
+    )
+    lines.append("")
+
+    measured = cal.get("measured", {})
+    lines.append(
+        "| head | rows | base rate | mean predicted | predicted range | ECE raw | "
+        "ECE calibrated | ECE raw (equal-count) | ECE calibrated (equal-count) |"
+    )
+    lines.append("|---|---|---|---|---|---|---|---|---|")
+    for head, label in (("shot", "shot"), ("defence", "defence wins first contact")):
+        entry = measured.get(head)
+        if not entry:
+            continue
+        lines.append(
+            f"| {label} | {entry['n']} | {_fmt(entry['base_rate'])} | "
+            f"{_fmt(entry['mean_prediction'])} | "
+            f"{_fmt(entry['min_prediction'])}-{_fmt(entry['max_prediction'])} | "
+            f"{_fmt(entry['ece_raw'])} | {_fmt(entry['ece_calibrated'])} | "
+            f"{_fmt(entry.get('ece_raw_quantile'))} | "
+            f"{_fmt(entry.get('ece_calibrated_quantile'))} |"
+        )
+    lines.append("")
+    for head, label in (("shot", "shot"), ("defence", "defence-wins")):
+        entry = measured.get(head)
+        if not entry:
+            continue
+        verdict = (
+            "so no calibrator ships for it"
+            if entry["chosen"] == "identity"
+            else f"so a `{entry['chosen']}` map ships with it"
+        )
+        lines.append(
+            f"- The raw {label} head spans "
+            f"{_fmt(entry['min_prediction'])}-{_fmt(entry['max_prediction'])} with a mean of "
+            f"{_fmt(entry['mean_prediction'])} against a base rate of "
+            f"{_fmt(entry['base_rate'])}. Raw ECE {_fmt(entry['ece_raw'])}, Brier "
+            f"{_fmt(entry.get('brier_raw'))}; the best nested calibrator reaches "
+            f"{_fmt(entry['ece_calibrated'])}, {verdict}."
+        )
+    lines.append("")
+    for head, label in (("shot", "shot"), ("defence", "defence wins first contact")):
+        entry = measured.get(head)
+        if not entry or not entry.get("curve"):
+            continue
+        lines.append(
+            format_reliability_markdown(
+                entry["curve"],
+                title=f"reliability of the raw {label} head, "
+                f"{CALIBRATION_BINS} equal-count bins",
+            )
+        )
+        lines.append("")
+    lines.append(
+        "The calibrated column is measured **nested**: for each fold the calibrator was "
+        "fitted on scores from an extra model that had seen neither that fold nor the fold "
+        "the calibrator was fitted on, so no held-out row ever contributed to the map applied "
+        "to it. The one approximation, stated rather than hidden: those extra models were "
+        "trained on three fifths of the data instead of four fifths, and a model trained on "
+        "less data is a little less confident, so this understates rather than overstates how "
+        "much shrinking the shipped head needs."
+    )
+    lines.append("")
+    lines.append(
+        "One consequence of measuring it that way, since it looks like a contradiction "
+        "otherwise: the *nested* column stitches together a different calibrator per fold, and "
+        "two rows in different folds can swap order across that seam, so the nested column is "
+        "not AUC-preserving. What ships is a single global map, and a single monotone map "
+        "cannot reorder anything — which is why the AUC tables above stand unchanged."
+    )
+    lines.append("")
+    shipped = cal.get("shipped", {})
+    if shipped:
+        files = {"shot": "`setpiece/assets/shot.pt`", "defence": "`setpiece/assets/receiver.pt`"}
+        carried = [h for h, e in shipped.items() if e["kind"] != "identity"]
+        bare = [h for h, e in shipped.items() if e["kind"] == "identity"]
+        if not carried:
+            lines.append(
+                "**The shipped checkpoints are uncalibrated, and deliberately so:** no "
+                "calibrator improved held-out ECE on either head, so neither checkpoint ships "
+                "one. The probabilities they emit are ranking scores."
+            )
+        else:
+            listed = " and ".join(
+                f"{files[h]} stores a `{shipped[h]['kind']}` map for its "
+                f"{'shot' if h == 'shot' else 'defence-wins'} probability"
+                for h in carried
+            )
+            lines.append(
+                f"**A calibrator ships inside the checkpoint it belongs to.** {listed}, under "
+                "`card[\"calibration\"]`, refitted on the full pooled out-of-fold predictions "
+                "once the nested measurement had chosen it. "
+                "`setpiece.calibration.calibrator_from_card` rebuilds one."
+            )
+            if bare:
+                lines.append("")
+                lines.append(
+                    "The remaining head — "
+                    + ", ".join("shot" if h == "shot" else "defence-wins" for h in bare)
+                    + " — ships **no** calibrator, because no candidate improved its held-out "
+                    "ECE. That is a measurement, not an omission."
+                )
+        lines.append("")
+        lines.append(
+            "Calibrators are **not** applied automatically. `score`, `suggest`, `demo` and the "
+            "app all print the raw sigmoid, so a probability from the CLI today is a ranking "
+            "score with a documented correction available beside it, not a calibrated "
+            "probability."
+        )
+        lines.append("")
+    return lines
+
+
+def _threshold_section(report: dict[str, Any]) -> list[str]:
+    """The receiver-label threshold audit, when an analysis run has attached one."""
+    sweep = report.get("label_threshold")
+    if not sweep:
+        return []
+    lines = ["## receiver label threshold", "", sweep["summary"], ""]
+    lines.append(sweep["table"])
+    lines.append("")
+    for note in sweep.get("notes", []):
+        lines.append(f"- {note}")
+    lines.append("")
+    return lines
 
 
 # --------------------------------------------------------------------------- #
@@ -939,26 +2258,38 @@ def train_all(
     weight_decay: float = DEFAULTS["weight_decay"],
     batch_size: int = DEFAULTS["batch_size"],
     seed: int = DEFAULTS["seed"],
+    seeds: int = DEFAULTS["seeds"],
     baseline_iters: int = DEFAULTS["baseline_iters"],
     limit: int | None = None,
     metrics_path: str | Path | None = None,
     quiet: bool = False,
     install: bool = False,
+    calibrate: bool = True,
+    sweep_threshold: bool = True,
+    cache_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Cross-validate both heads, evaluate the baselines, then fit and save.
 
-    Runs purged group k-fold on ``dataset_path``, pools the out-of-fold
-    predictions of the GNN and of both baselines, writes a markdown metrics table
-    to stdout and to ``metrics_path`` (``docs/metrics.md`` by default), then
-    refits each head on the whole dataset and saves ``receiver.pt`` and
+    Runs purged group k-fold on ``dataset_path`` ``seeds`` times over — each
+    repeat re-drawing both the fold assignment and the initialisation — pools the
+    out-of-fold predictions of the GNN and of both baselines, and reports every
+    figure as a mean with the spread across repeats. It writes a markdown metrics
+    table to stdout and to ``metrics_path`` (``docs/metrics.md`` by default),
+    then refits each head on the whole dataset and saves ``receiver.pt`` and
     ``shot.pt`` into ``out_dir`` with a fully populated model card.
+
+    With ``calibrate``, both binary heads are additionally measured against
+    observed frequencies, a calibrator is chosen on a nested protocol that costs
+    three extra fits per head, and the chosen map travels in the model cards. It
+    is on by default and can be turned off for a smoke run.
 
     With ``install``, the two refitted checkpoints are also copied over the
     bundled ones in ``setpiece/assets/``, which is what ``score``, ``suggest``,
     ``demo`` and the app load by default.
 
     Returns the report dict: ``data``, ``splits``, ``receiver``, ``shot``,
-    ``params``, ``paths``, ``date``, ``training``.
+    ``spread``, ``seeds``, ``calibration``, ``label_threshold``, ``params``,
+    ``paths``, ``date``, ``training``.
     """
     set_seed(seed)
     dataset_path = Path(dataset_path)
@@ -969,123 +2300,68 @@ def train_all(
         if not quiet:
             print(message, flush=True)
 
-    assignment = purged_fold_assignment([r.group for r in rows], folds, seed=seed)
-    n_folds = int(assignment.max()) + 1
-    splits = _split_summary(rows, assignment)
+    hp = {
+        "epochs": epochs,
+        "hidden": hidden,
+        "layers": layers,
+        "dropout": dropout,
+        "lr": lr,
+        "weight_decay": weight_decay,
+        "batch_size": batch_size,
+        "baseline_iters": baseline_iters,
+        "baseline_lr": DEFAULTS["baseline_lr"],
+        "baseline_weight_decay": DEFAULTS["baseline_weight_decay"],
+    }
+    seed_values = seed_list(seed, seeds)
     log(
-        f"{len(rows)} corners, {splits['n_matches']} matches, {n_folds} purged folds "
-        f"(rows per fold {splits['rows_per_fold']})"
+        f"{len(rows)} corners, {len({r.group for r in rows})} matches, {folds} purged folds, "
+        f"{len(seed_values)} repeat(s) at seeds {seed_values}, "
+        f"torch.get_num_threads()={torch.get_num_threads()}"
     )
 
-    n = len(rows)
-    receiver_ids = [i for i in range(n) if rows[i].receiver_valid]
-    oof_receiver: dict[str, dict[int, tuple[np.ndarray, float]]] = {
-        "gnn": {},
-        "heuristic": {},
-        "logreg": {},
-    }
-    oof_shot: dict[str, np.ndarray] = {
-        key: np.full(n, np.nan, dtype=np.float64) for key in ("gnn", "heuristic", "logreg")
-    }
+    passes: list[CVResult] = []
+    per_seed: list[dict[str, Any]] = []
+    for s in seed_values:
+        cv = cached_cross_validate(
+            rows,
+            dataset_path=dataset_path,
+            folds=folds,
+            seed=s,
+            hp=hp,
+            cache_dir=cache_dir,
+            log=log,
+        )
+        passes.append(cv)
+        per_seed.append(metrics_from_oof(rows, cv))
 
-    for fold in range(n_folds):
-        test_idx = np.nonzero(assignment == fold)[0]
-        train_idx = np.nonzero(assignment != fold)[0]
-        train_rows = [rows[i] for i in train_idx]
-        test_rows = [rows[i] for i in test_idx]
-        test_recv_idx = [i for i in test_idx if rows[i].receiver_valid]
-        test_recv_rows = [rows[i] for i in test_recv_idx]
-        log(f"fold {fold + 1}/{n_folds}: train {len(train_rows)}, test {len(test_rows)}")
+    means, spread = summarise_seeds(per_seed)
+    receiver_report = means["receiver"]
+    shot_report = means["shot"]
+    primary = passes[0]
+    splits = primary.splits
+    n_folds = splits["n_folds"]
 
-        receiver_model = _train_receiver(
-            train_rows,
-            epochs=epochs,
-            hidden=hidden,
-            layers=layers,
-            dropout=dropout,
-            lr=lr,
-            weight_decay=weight_decay,
-            batch_size=batch_size,
-            seed=seed + fold,
-        )
-        shot_model = _train_shot(
-            train_rows,
-            epochs=epochs,
-            hidden=hidden,
-            layers=layers,
-            dropout=dropout,
-            lr=lr,
-            weight_decay=weight_decay,
-            batch_size=batch_size,
-            seed=seed + fold,
-        )
-
-        train_valid = [r for r in train_rows if r.receiver_valid]
-        prior = (
-            float(np.mean([r.target_pos < 0 for r in train_valid])) if train_valid else 0.5
-        )
-        shot_rate = float(np.mean([r.y_shot for r in train_rows])) if train_rows else 0.5
-        logreg_recv = _fit_receiver_logreg(
-            train_rows,
-            iters=baseline_iters,
-            lr=DEFAULTS["baseline_lr"],
-            weight_decay=DEFAULTS["baseline_weight_decay"],
-            seed=seed + fold,
-        )
-        logreg_shot = _fit_shot_logreg(
-            train_rows,
-            iters=baseline_iters,
-            lr=DEFAULTS["baseline_lr"],
-            weight_decay=DEFAULTS["baseline_weight_decay"],
-            seed=seed + fold,
-        )
-
-        preds: dict[str, tuple[list[np.ndarray], np.ndarray]] = {
-            "gnn": _predict_receiver_gnn(receiver_model, test_recv_rows, batch_size),
-            "heuristic": _heuristic_receiver(test_recv_rows, prior),
-            "logreg": logreg_recv.predict(test_recv_rows),
+    calibration: dict[str, Any] | None = None
+    if calibrate:
+        log("measuring calibration of both binary heads")
+        in_sample = calibration_from_oof(rows, primary)
+        nested = nested_calibration(rows, primary, hp=hp, log=log)
+        shipped_cal = fit_shipped_calibrators(rows, primary, nested)
+        calibration = {
+            "bins": CALIBRATION_BINS,
+            "seed": primary.seed,
+            "measured": summarise_calibration(in_sample, nested, shipped_cal),
+            "nested": nested,
+            "in_sample": in_sample,
+            "shipped": shipped_cal,
         }
-        for name, (cand_probs, p_def) in preds.items():
-            # The table is only a comparison if all three models are scored on
-            # exactly these rows in exactly this order. A predictor returning a
-            # longer list would otherwise misalign silently and never raise.
-            if len(cand_probs) != len(test_recv_idx) or len(p_def) != len(test_recv_idx):
-                raise RuntimeError(
-                    f"{name} returned {len(cand_probs)} candidate distributions and "
-                    f"{len(p_def)} defence probabilities for {len(test_recv_idx)} held-out "
-                    "receiver rows; every model must be scored on the identical rows"
-                )
-            for slot, row_id in enumerate(test_recv_idx):
-                oof_receiver[name][row_id] = (cand_probs[slot], float(p_def[slot]))
 
-        oof_shot["gnn"][test_idx] = _predict_shot_gnn(shot_model, test_rows, batch_size)
-        oof_shot["heuristic"][test_idx] = shot_rate
-        oof_shot["logreg"][test_idx] = logreg_shot.predict(test_rows)
-
-    target_pos = np.asarray([rows[i].target_pos for i in receiver_ids], dtype=np.int64)
-    receiver_report: dict[str, Any] = {}
-    for name in ("gnn", "heuristic", "logreg"):
-        cand_probs = [oof_receiver[name][i][0] for i in receiver_ids]
-        p_def = np.asarray([oof_receiver[name][i][1] for i in receiver_ids], dtype=np.float64)
-        receiver_report[name] = receiver_metrics(cand_probs, p_def, target_pos)
-
-    n_cands = np.asarray([rows[i].cand_nodes.size for i in receiver_ids], dtype=np.float64)
-    attacker_first = target_pos >= 0
-    receiver_report["chance"] = {
-        "top1_attacker": float(np.mean(1.0 / n_cands[attacker_first]))
-        if attacker_first.any()
-        else float("nan"),
-        "top3_attacker": float(np.mean(np.minimum(3.0, n_cands[attacker_first]) /
-                                       n_cands[attacker_first]))
-        if attacker_first.any()
-        else float("nan"),
-    }
-    receiver_report["always_defence_accuracy"] = (
-        float(np.mean(target_pos < 0)) if target_pos.size else float("nan")
+    label_threshold = (
+        label_threshold_sweep(rows, passes) if sweep_threshold else None
     )
 
     y_shot = np.asarray([r.y_shot for r in rows], dtype=np.float64)
-    shot_report = {name: shot_metrics(y_shot, oof_shot[name]) for name in oof_shot}
+    receiver_ids = [i for i in range(len(rows)) if rows[i].receiver_valid]
 
     log("fitting final models on the full dataset")
     final_receiver = _train_receiver(
@@ -1130,6 +2406,7 @@ def train_all(
         "weight_decay": weight_decay,
         "batch_size": batch_size,
         "seed": seed,
+        "seeds": seed_values,
         "baseline_iters": baseline_iters,
         "optimiser": "adam",
         "final_fit": "refit on every corner after cross-validation",
@@ -1142,12 +2419,19 @@ def train_all(
         "splits": splits,
         "receiver": receiver_report,
         "shot": shot_report,
+        "spread": spread,
+        "seeds": seed_values,
+        "per_seed": per_seed_summary(per_seed),
         "training": training,
         "params": {
             "receiver": count_parameters(final_receiver),
             "shot": count_parameters(final_shot),
         },
     }
+    if calibration is not None:
+        report["calibration"] = calibration
+    if label_threshold is not None:
+        report["label_threshold"] = label_threshold
 
     feature_card = {
         "node_features": list(featmod.FEATURE_NAMES),
@@ -1160,6 +2444,10 @@ def train_all(
 
     out_dir.mkdir(parents=True, exist_ok=True)
     paths: dict[str, str] = {}
+    # Each checkpoint carries the calibrator for its own binary head, and only
+    # that one: the receiver head's calibratable probability is "the defence wins
+    # first contact", the shot head's is the shot sigmoid.
+    card_calibration = {"receiver": "defence", "shot": "shot"}
     for name, model, metrics in (
         ("receiver", final_receiver, receiver_report),
         ("shot", final_shot, shot_report),
@@ -1169,12 +2457,25 @@ def train_all(
             "data": data_summary,
             "splits": splits,
             "metrics": metrics,
+            "metrics_spread": spread[name],
+            "seeds": seed_values,
             "date": report["date"],
             "features": feature_card,
             "params": count_parameters(model),
             "training": training,
             "assume_static": True,
         }
+        if calibration is not None:
+            head = card_calibration[name]
+            card["calibration"] = {head: calibration["shipped"][head]}
+        if label_threshold is not None and name == "receiver":
+            card["label_threshold"] = {
+                "shipped_threshold_m": label_threshold["shipped_threshold"],
+                "entries": [
+                    {k: v for k, v in e.items() if k != "metrics"}
+                    for e in label_threshold["entries"]
+                ],
+            }
         path = out_dir / f"{name}.pt"
         save_model(model, path, card)
         paths[name] = str(path)
@@ -1190,6 +2491,16 @@ def train_all(
         log(f"wrote {target}")
     (out_dir / "report.json").write_text(json.dumps(report, indent=2, default=str))
     report["paths"]["report"] = str(out_dir / "report.json")
+    # The primary pass's raw predictions, so the label audit and any later
+    # re-scoring can be redone without retraining a thing.
+    report["paths"]["oof"] = str(
+        save_oof(
+            rows,
+            primary,
+            out_dir / "oof.npz",
+            signature=oof_signature(rows, dataset_path, folds, hp),
+        )
+    )
 
     if install:
         from setpiece.models import ASSETS_DIR
@@ -1241,6 +2552,31 @@ def add_train_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     parser.add_argument("--weight-decay", type=float, default=DEFAULTS["weight_decay"])
     parser.add_argument("--batch-size", type=int, default=DEFAULTS["batch_size"])
     parser.add_argument("--seed", type=int, default=DEFAULTS["seed"])
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        default=DEFAULTS["seeds"],
+        help="repeat the whole cross-validation this many times and report mean ±sd "
+        "(default: %(default)s). GNN training is only reproducible at a fixed thread "
+        "count, so a single run quoted to three decimals overstates its own precision.",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        default=None,
+        help="reuse and write per-seed out-of-fold predictions here, so repeats can be "
+        "precomputed in parallel (see analysis/precompute_oof.py) and the report "
+        "regenerated without retraining",
+    )
+    parser.add_argument(
+        "--no-calibrate",
+        action="store_true",
+        help="skip the calibration measurement; it costs three extra fits per head",
+    )
+    parser.add_argument(
+        "--no-threshold-sweep",
+        action="store_true",
+        help="skip the receiver-label match-threshold audit",
+    )
     parser.add_argument("--baseline-iters", type=int, default=DEFAULTS["baseline_iters"])
     parser.add_argument("--limit", type=int, default=None, help="use only the first N corners")
     parser.add_argument("--quiet", action="store_true", help="suppress progress lines")
@@ -1271,11 +2607,15 @@ def run_from_args(args: argparse.Namespace) -> int:
         weight_decay=args.weight_decay,
         batch_size=args.batch_size,
         seed=args.seed,
+        seeds=getattr(args, "seeds", DEFAULTS["seeds"]),
         baseline_iters=args.baseline_iters,
         limit=args.limit,
         metrics_path=metrics_path,
         quiet=getattr(args, "quiet", False),
         install=getattr(args, "install", False),
+        calibrate=not getattr(args, "no_calibrate", False),
+        sweep_threshold=not getattr(args, "no_threshold_sweep", False),
+        cache_dir=getattr(args, "cache_dir", None),
     )
     return 0
 
