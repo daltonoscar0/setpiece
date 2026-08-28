@@ -8,6 +8,15 @@ Freeze frames carry no velocities, so every feature here is positional. Nothing
 in this module reads ``frame.meta["end_xy"]`` or ``frame.meta["pass_outcome"]``:
 both are label-adjacent and are diagnostics only.
 
+Mirrored coordinates
+--------------------
+Every frame is reflected about the pitch's long axis, ``y = GOAL_Y``, so that the
+corner is always taken from the ``y < GOAL_Y`` side. A corner from the left and
+its mirror image from the right are the same coaching situation — same near
+post, same far post, same runs — and without the reflection the network has to
+learn each half of the pitch separately from half the data. See
+:func:`mirror_side`.
+
 Receiver target and batching
 ----------------------------
 ``y_receiver`` is a **node index**, and it is stored **graph-local**: it indexes
@@ -76,11 +85,14 @@ _RIGHT_ANGLE: float = math.pi / 2.0
 _NEAR_RADIUS: float = 3.0
 _MID_RADIUS: float = 5.0
 
+# Every positional feature below is computed in mirrored coordinates: the frame
+# is reflected about y = GOAL_Y whenever the corner is taken from the far side,
+# so "the taker's side of the pitch" is always y < GOAL_Y. See mirror_side.
 FEATURE_NAMES: list[str] = [
     "x_norm",  # x / 105
-    "y_norm",  # y / 68
+    "y_norm",  # mirrored y / 68; < 0.5 is the taker's side
     "dx_goal",  # (goal_x - x) / 30
-    "dy_goal",  # (y - goal_y) / 30, signed: positive is the far side
+    "dy_goal",  # (y - goal_y) / 30, signed: negative is the taker's side
     "dist_goal",  # |p - goal| / 30
     "goal_angle_cos",  # direction to the goal centre, cyclic-safe encoding
     "goal_angle_sin",
@@ -155,6 +167,61 @@ def _positions(players: list[Player]) -> np.ndarray:
     return np.asarray([[p.x, p.y] for p in players], dtype=np.float64).reshape(-1, 2)
 
 
+def mirror_side(frame: CornerFrame) -> float:
+    """``+1.0`` if the corner is already taken from the ``y < GOAL_Y`` side, else ``-1.0``.
+
+    Multiplying ``y - GOAL_Y`` by this reflects the frame about the pitch's long
+    axis, which is what :func:`_mirror_y` does. Both halves of the pitch then
+    look the same to the model, so a near-post run is a near-post run whichever
+    corner flag the ball came from.
+
+    A taker exactly on ``y == GOAL_Y`` is degenerate — no corner is taken from
+    the middle of the pitch — and returns ``+1.0``, i.e. the frame is left
+    alone. Reflection invariance cannot hold there for *any* taker-based rule,
+    because such a frame and its mirror image put the taker on the same line and
+    so choose the same side.
+
+    When the frame carries no taker flag at all (user CSV input),
+    :func:`taker_position` infers the corner flag first, so the side follows the
+    inferred flag. That inference has the same degenerate case: a frame whose
+    players are exactly symmetric about ``y = GOAL_Y`` is equidistant from both
+    flags, and the tie-break picks the same flag for it and for its mirror
+    image, so those two frames also featurise differently. Neither degeneracy is
+    reachable from a real corner — measured over all 2464 corners in the
+    dataset, no taker sits on the centre line, and reflection invariance is
+    exact (max absolute difference 0.0 in both ``x`` and ``edge_attr``).
+    """
+    _, ty = taker_position(frame)
+    return 1.0 if ty <= GOAL_Y else -1.0
+
+
+def _mirror_y(y: np.ndarray | float, side: float) -> np.ndarray | float:
+    """Reflect ``y`` about ``GOAL_Y`` when ``side`` is ``-1.0``; identity otherwise.
+
+    The ``side > 0`` case returns ``y`` untouched rather than evaluating the
+    arithmetic identity: ``GOAL_Y + (y - GOAL_Y)`` is not bit-exact in floating
+    point, and a half-ulp shift in one coordinate but not another turns the
+    taker's own zero-distance ``taker_angle`` from ``(1, 0)`` into ``(0, 1)``.
+    """
+    return y if side > 0.0 else GOAL_Y + (y - GOAL_Y) * side
+
+
+def _mirrored_positions(frame: CornerFrame, side: float) -> np.ndarray:
+    """Player positions in mirrored coordinates, ``float64 [N, 2]``.
+
+    Reflecting the coordinates once, here, is what makes the whole featuriser
+    mirror-invariant: distances, densities, adjacency and the box flags are
+    untouched by a reflection, and every signed ``y`` quantity downstream — the
+    goal and taker angles, ``dy_goal``, the edge ``dy`` — inherits the flip
+    without needing its own sign rule. ``GOAL_Y`` is the pitch's centre line and
+    both posts sit symmetrically about it, so nothing else has to move.
+    """
+    pos = _positions(frame.players)
+    if pos.size:
+        pos[:, 1] = _mirror_y(pos[:, 1], side)
+    return pos
+
+
 def _pairwise_distances(pos: np.ndarray) -> np.ndarray:
     diff = pos[:, None, :] - pos[None, :, :]
     return np.hypot(diff[:, :, 0], diff[:, :, 1])
@@ -170,11 +237,14 @@ def _post_angles(pos: np.ndarray) -> np.ndarray:
 
 
 def taker_position(frame: CornerFrame) -> tuple[float, float]:
-    """Where the corner is taken from.
+    """Where the corner is taken from, in raw (unmirrored) pitch coordinates.
 
     Normally the freeze frame flags the taker. User-supplied frames sometimes do
     not, in which case we fall back to the corner flag nearest to any player —
-    a geometric inference, never an invented node.
+    a geometric inference, never an invented node. The result feeds
+    :func:`mirror_side`, so on the fallback path the whole featurisation hangs
+    off this inference; ties go to the ``y = 0`` flag, and an empty frame
+    returns it too.
     """
     idx = frame.taker_index
     if idx is not None:
@@ -201,7 +271,8 @@ def _node_features(frame: CornerFrame) -> np.ndarray:
     if n == 0:
         return feats.astype(np.float32)
 
-    pos = _positions(players)
+    side = mirror_side(frame)
+    pos = _mirrored_positions(frame, side)
     x = pos[:, 0]
     y = pos[:, 1]
     is_attacker = np.asarray([p.is_attacker for p in players], dtype=bool)
@@ -213,7 +284,8 @@ def _node_features(frame: CornerFrame) -> np.ndarray:
     goal_dist = np.hypot(gdx, gdy)
     goal_angle = np.arctan2(gdy, gdx)
 
-    tx, ty = taker_position(frame)
+    tx, ty_raw = taker_position(frame)
+    ty = _mirror_y(ty_raw, side)
     tdx = tx - x
     tdy = ty - y
     taker_dist = np.hypot(tdx, tdy)
@@ -356,11 +428,19 @@ def build_flat(frame: CornerFrame) -> np.ndarray:
 def build_graph(frame: CornerFrame) -> CornerData:
     """Featurise one corner into a graph.
 
+    Node and edge features are built in mirrored coordinates (see
+    :func:`mirror_side`), so a corner and its reflection about ``y = GOAL_Y``
+    give identical ``x`` and ``edge_attr``. Player order, flags and labels are
+    left exactly as they came in — the reflection is a change of coordinates,
+    not a relabelling.
+
     Works on an unlabelled frame: then ``y_receiver = -1``,
     ``y_receiver_valid = False`` and ``y_shot = 0.0``.
     """
     n = len(frame.players)
-    pos = _positions(frame.players)
+    # the same mirrored coordinates the node features use, so node and edge
+    # features are reflected consistently
+    pos = _mirrored_positions(frame, mirror_side(frame))
     dist = _pairwise_distances(pos) if n else np.zeros((0, 0))
 
     node_x = _node_features(frame)

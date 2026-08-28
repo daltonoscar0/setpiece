@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import random
+import statistics
 import warnings
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from setpiece._io import read_corners
 from setpiece.suggest import (
     DEEP_CANDIDATE_DEFENDERS,
     DEFAULT_MAX_EVALS,
+    EPS,
     MAX_CANDIDATE_DEFENDERS,
     Move,
     Suggestion,
@@ -821,6 +823,190 @@ def test_pretty_output_states_the_search_width() -> None:
     wide_text = cli.format_suggestions([wide], "pretty")
     assert "all defenders for the first move, all for later moves" in wide_text
     assert "keeper movable" in wide_text
+
+
+# --------------------------------------------------------------------------- #
+# what a delta is worth: the random-move control and the second opinion
+#
+# `docs/search-objective.md` measures, on 400 real corners, whether a delta from
+# `suggest` survives being re-scored by a different model. Two of its pieces are
+# properties of the search itself rather than of any checkpoint, so they are
+# asserted here against the stand-in scorers: the null it is measured against
+# must be legal, and the search must beat that null under its own objective. The
+# third piece — that a delta is relative to the objective that produced it — is
+# the caveat the document exists to record, and it is asserted directly.
+# --------------------------------------------------------------------------- #
+class RivalShotModel:
+    """A deliberately different function of the same freeze frame.
+
+    :class:`FakeShotModel` scores individual marking: every attacker's threat
+    grows with the distance to its nearest defender. This one ignores marking
+    entirely and scores how far the three deepest defenders sit from the goal
+    centre. Both are smooth, both are decreasing in defensive quality, and they
+    disagree about which defender is worth moving — which is the point.
+    """
+
+    def __call__(self, frame: CornerFrame) -> float:
+        dists = sorted(
+            math.hypot(GOAL_X - p.x, GOAL_Y - p.y)
+            for p in frame.players
+            if not p.is_attacker and not p.is_taker
+        )
+        near = dists[:3]
+        mean = sum(near) / len(near) if near else 20.0
+        return 1.0 / (1.0 + math.exp(-(mean - 10.0) / 3.0))
+
+
+def random_legal_moves(
+    frame: CornerFrame,
+    k: int,
+    rng: random.Random,
+    *,
+    max_move: float = 3.0,
+    min_sep: float = 0.5,
+    pool: list[int] | None = None,
+    attempts: int = 50,
+) -> list[Move] | None:
+    """Draw ``k`` moves uniformly from the legal set, ignoring the shot model.
+
+    This is the null `docs/search-objective.md` measures the search against, and
+    it is only a meaningful null if every draw satisfies exactly the constraints
+    the search enforces: distinct defenders, keeper and taker and attackers
+    excluded, one displacement each from the identical candidate set, at least
+    ``min_sep`` from every other player afterwards, and on the pitch. Returns
+    ``None`` if no legal draw was found in ``attempts`` tries.
+    """
+    if pool is None:
+        pool = _movable_by_distance(frame)
+    if k <= 0 or len(pool) < k:
+        return None
+    displacements = candidate_displacements(max_move, 0)
+    for _ in range(attempts):
+        xs = [p.x for p in frame.players]
+        ys = [p.y for p in frame.players]
+        moves: list[Move] = []
+        for idx in rng.sample(pool, k):
+            options = [
+                (dx, dy)
+                for dx, dy in displacements
+                if _admissible_here(xs, ys, idx, xs[idx] + dx, ys[idx] + dy, min_sep)
+            ]
+            if not options:
+                break
+            dx, dy = rng.choice(options)
+            xs[idx] += dx
+            ys[idx] += dy
+            moves.append(Move(player_idx=idx, dx=dx, dy=dy))
+        else:
+            return moves
+    return None
+
+
+def _movable_by_distance(frame: CornerFrame) -> list[int]:
+    """Exactly what the search will move: defenders, keeper excluded, near first."""
+    idxs = [
+        i
+        for i, p in enumerate(frame.players)
+        if not p.is_attacker and not p.is_taker and not p.is_keeper
+    ]
+    return sorted(idxs, key=lambda i: math.hypot(GOAL_X - frame.players[i].x, GOAL_Y - frame.players[i].y))
+
+
+def _admissible_here(
+    xs: list[float], ys: list[float], idx: int, nx: float, ny: float, min_sep: float
+) -> bool:
+    if not (0.0 <= nx <= PITCH_LENGTH) or not (0.0 <= ny <= PITCH_WIDTH):
+        return False
+    return all(
+        j == idx or math.hypot(nx - xs[j], ny - ys[j]) >= min_sep - EPS for j in range(len(xs))
+    )
+
+
+@pytest.mark.parametrize("trial", range(6))
+def test_random_legal_moves_obey_the_same_hard_constraints(trial: int) -> None:
+    """The null must be legal, or beating it would prove nothing."""
+    frame = random_frame(random.Random(1000 + trial))
+    rng = random.Random(9000 + trial)
+    for _ in range(20):
+        moves = random_legal_moves(frame, 3, rng)
+        assert moves is not None
+        assert len(moves) == 3
+        check_constraints(
+            frame,
+            Suggestion(moves=moves, base_prob=0.0, new_prob=0.0, delta=0.0),
+            movers=3,
+            max_move=3.0,
+            min_sep=0.5,
+        )
+
+
+def test_the_search_beats_random_legal_moves_under_its_own_objective() -> None:
+    """The control from `docs/search-objective.md`, on the stand-in scorer.
+
+    Under the model it is optimising, a searched adjustment must be clearly
+    better than moving the same number of defenders at random. On the real
+    checkpoints the search beat every one of 20 draws on 400 of 400 corners; the
+    stand-in is a smoother surface with a wider spread, so the assertions here
+    are the robust form — better than the median draw on every frame, and better
+    than the overwhelming majority of individual draws.
+    """
+    beaten = total = 0
+    for trial in range(8):
+        frame = random_frame(random.Random(1000 + trial))
+        base = FakeShotModel()(frame)
+        best = suggest(frame, FakeShotModel(), movers=3, seed=trial)[0]
+
+        rng = random.Random(9000 + trial)
+        deltas = []
+        for _ in range(20):
+            moves = random_legal_moves(frame, len(best.moves), rng)
+            assert moves is not None
+            deltas.append(FakeShotModel()(apply_moves(frame, moves)) - base)
+
+        assert best.delta < statistics.median(deltas)
+        beaten += sum(1 for d in deltas if best.delta < d)
+        total += len(deltas)
+
+    assert beaten / total >= 0.95, f"the search only beat {beaten}/{total} random legal draws"
+
+
+def test_a_delta_belongs_to_the_objective_that_produced_it() -> None:
+    """`Suggestion.delta` is one model's opinion, and the tool must not pretend otherwise.
+
+    The number `suggest` reports comes from the callable it was handed. Replaying
+    the very same moves under a different, equally reasonable shot model gives a
+    different number — measured at +0.10 Pearson between the two deltas across
+    model families on 400 real corners, an interval that contains zero. Here that
+    is asserted as the categorical fact underneath it: the two scorers disagree
+    about how much the shape improved, and about which shape improved most.
+    """
+    rival = RivalShotModel()
+    disagreed_on_the_best = 0
+
+    for trial in range(8):
+        frame = random_frame(random.Random(1000 + trial))
+        out = suggest(frame, FakeShotModel(), movers=3, seed=trial)
+        assert len(out) > 1
+
+        rival_base = rival(frame)
+        rival_deltas = [rival(apply_moves(frame, s.moves)) - rival_base for s in out]
+
+        # the searching model's own bookkeeping is exact ...
+        for sug in out:
+            assert sug.new_prob == pytest.approx(
+                FakeShotModel()(apply_moves(frame, sug.moves)), abs=1e-12
+            )
+        # ... and says nothing about what the second model makes of the same shape
+        for sug, rival_delta in zip(out, rival_deltas, strict=True):
+            assert rival_delta != pytest.approx(sug.delta, abs=1e-6)
+
+        if rival_deltas.index(min(rival_deltas)) != 0:
+            disagreed_on_the_best += 1
+
+    assert disagreed_on_the_best > 0, (
+        "the second model ranked the searching model's best suggestion first every time; "
+        "the two stand-ins are no longer independent enough to make the point"
+    )
 
 
 def _tight_pairs(frame: CornerFrame, min_sep: float) -> set[tuple[int, int]]:

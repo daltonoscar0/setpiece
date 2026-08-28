@@ -38,6 +38,7 @@ written from this module records ``assume_static: True``.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import random
@@ -54,7 +55,12 @@ from torch import Tensor, nn
 from torch_geometric.loader import DataLoader
 
 from setpiece import features as featmod
-from setpiece._io import RECEIVER_MATCH_MAX_M, read_corners
+from setpiece._io import (
+    FIRST_TOUCH_MAX_S,
+    RECEIVER_MATCH_MAX_M,
+    SHOT_MAX_S,
+    read_corners,
+)
 from setpiece.calibration import (
     Calibrator,
     calibration_report,
@@ -80,8 +86,12 @@ __all__ = [
     "build_parser",
     "cached_cross_validate",
     "calibration_from_oof",
+    "coverage_summary",
     "cross_validate",
+    "format_dataset_markdown",
+    "format_metrics_markdown",
     "label_threshold_sweep",
+    "label_window_summary",
     "load_oof",
     "load_rows",
     "main",
@@ -91,6 +101,7 @@ __all__ = [
     "purged_fold_assignment",
     "receiver_metrics",
     "roc_auc",
+    "rows_digest",
     "run_from_args",
     "save_oof",
     "seed_list",
@@ -315,6 +326,7 @@ class Row:
     first_touch: str = "unknown"
     receiver_match_dist: float | None = None
     first_touch_dt: float | None = None
+    shot_dt: float | None = None
 
 
 def _pool(flat: np.ndarray, is_attacker: np.ndarray) -> np.ndarray:
@@ -385,6 +397,7 @@ def _row_from_frame(frame: CornerFrame) -> Row:
         first_touch=str(frame.first_touch),
         receiver_match_dist=frame.receiver_match_dist,
         first_touch_dt=(frame.meta or {}).get("first_touch_dt"),
+        shot_dt=(frame.meta or {}).get("shot_dt"),
     )
 
 
@@ -396,6 +409,155 @@ def load_rows(dataset_path: str | Path, *, limit: int | None = None) -> list[Row
     if not frames:
         raise ValueError(f"no corners in {dataset_path}")
     return [_row_from_frame(f) for f in frames]
+
+
+def _quantiles(values: Sequence[float]) -> dict[str, float]:
+    arr = np.asarray([v for v in values if v is not None], dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return {}
+    return {
+        "n": int(arr.size),
+        "median": float(np.median(arr)),
+        "p90": float(np.percentile(arr, 90)),
+        "max": float(arr.max()),
+    }
+
+
+def label_window_summary(
+    rows: Sequence[Row], *, baseline_path: str | Path | None = None
+) -> dict[str, Any]:
+    """What the plausibility guards on the label windows actually did.
+
+    ``first_touch`` and ``shot_within_5`` are defined by **event-count** windows,
+    per the spec, and an event-count window stretches with how densely the match
+    was tagged — so it walks straight through a dead ball and calls the restart
+    twelve events later "the first touch on this corner".
+    :mod:`setpiece._io` therefore discards a touch more than
+    ``FIRST_TOUCH_MAX_S`` after the delivery and a shot more than ``SHOT_MAX_S``
+    after it. The labels stay event-based; a touch outside the window is dropped,
+    never relabelled, which is why a guarded dataset has an ``"unknown"``
+    first-touch class that an unguarded one does not.
+
+    This measures the bite: how many rows each guard caught and how far outside
+    the window the worst of them sat. With ``baseline_path`` — a build of the
+    same corners from *before* the guards — the classes those rows used to carry
+    are reported too. That is the one part a guarded dataset cannot tell you
+    about itself: the guard records that a touch was implausible, not which team
+    it would have been credited to.
+    """
+    summary: dict[str, Any] = {
+        "first_touch_max_s": FIRST_TOUCH_MAX_S,
+        "shot_max_s": SHOT_MAX_S,
+        "first_touch": {
+            key: sum(1 for r in rows if r.first_touch == key)
+            for key in ("defender", "attacker", "unknown")
+        },
+        "first_touch_dt": _quantiles([r.first_touch_dt for r in rows]),
+        "shot_dt": _quantiles([r.shot_dt for r in rows]),
+        # attacker-first corners whose receiver was matched to a node, which is the
+        # count the receiver head trains on; not the same as the rows it scores,
+        # which include every defence-wins corner.
+        "n_receiver_labels": sum(1 for r in rows if r.target_pos >= 0),
+    }
+    late = [
+        r for r in rows if r.first_touch_dt is not None and r.first_touch_dt > FIRST_TOUCH_MAX_S
+    ]
+    summary["late_first_touch"] = {
+        "n": len(late),
+        "max_s": max((r.first_touch_dt for r in late), default=None),
+        "now_unknown": sum(1 for r in late if r.first_touch == "unknown"),
+    }
+    late_shot = [r for r in rows if r.shot_dt is not None and r.shot_dt > SHOT_MAX_S]
+    summary["late_shot"] = {
+        "n": len(late_shot),
+        "max_s": max((r.shot_dt for r in late_shot), default=None),
+    }
+    if baseline_path is None:
+        return summary
+
+    before = {f.corner_id: f for f in read_corners(Path(baseline_path))}
+    late_ids = [r.corner_id for r in late]
+    summary["baseline"] = {
+        "path": str(baseline_path),
+        "n_corners": len(before),
+        "first_touch": {
+            key: sum(1 for f in before.values() if f.first_touch == key)
+            for key in ("defender", "attacker", "unknown")
+        },
+        "n_receiver_labels": sum(1 for f in before.values() if f.receiver_idx is not None),
+        "shot_base_rate": (
+            float(np.mean([float(f.shot_within_5) for f in before.values()])) if before else None
+        ),
+        # What the guard reclassified, by the class the row used to carry.
+        "late_first_touch_was": {
+            key: sum(1 for c in late_ids if c in before and before[c].first_touch == key)
+            for key in ("defender", "attacker", "unknown")
+        },
+        "shot_flips": sum(
+            1
+            for r in rows
+            if r.corner_id in before and float(before[r.corner_id].shot_within_5) != r.y_shot
+        ),
+    }
+    return summary
+
+
+def coverage_summary(dataset_path: str | Path) -> dict[str, Any] | None:
+    """360 coverage of the corners this dataset was built from, per competition.
+
+    ``setpiece fetch`` writes a ledger beside the dataset that counts, per season,
+    every corner it *saw* in the event feed against the ones that came with a 360
+    freeze frame. That ratio is the honest description of what the dataset is a
+    sample of, and it is not close to uniform: a competition StatsBomb flags for
+    360 can still ship no freeze frames at all. Seasons are folded into their
+    competition here because that is the granularity the metrics table names.
+
+    Returns ``None`` when no ledger sits beside the dataset, or when it predates
+    the coverage counters — the numbers are not reconstructable from the corners
+    that survived, since a corner with no frame never became a row.
+    """
+    dataset_path = Path(dataset_path)
+    state = dataset_path.with_name(f"{dataset_path.stem}.state.json")
+    if not state.exists():
+        return None
+    try:
+        coverage = json.loads(state.read_text()).get("coverage")
+    except (OSError, json.JSONDecodeError):  # pragma: no cover - unreadable ledger
+        return None
+    if not coverage:
+        return None
+
+    per_competition: dict[str, dict[str, int]] = {}
+    for key, counts in coverage.items():
+        # ledger keys are "<competition> <season>"; the season is the last token
+        name = key.rsplit(" ", 1)[0] if " " in key else key
+        entry = per_competition.setdefault(name, {"seen": 0, "with_frame": 0, "dropped": 0})
+        entry["seen"] += int(counts.get("corners_seen", 0))
+        entry["with_frame"] += int(counts.get("corners_with_frame", 0))
+        entry["dropped"] += int(counts.get("dropped_too_few_players", 0))
+    seen = sum(e["seen"] for e in per_competition.values())
+    if seen == 0:  # pragma: no cover - a ledger that saw nothing
+        return None
+    with_frame = sum(e["with_frame"] for e in per_competition.values())
+    entries = [
+        {"competition": name, "rate": e["with_frame"] / e["seen"], **e}
+        for name, e in per_competition.items()
+        if e["seen"]
+    ]
+    entries.sort(key=lambda e: e["rate"])
+    covered = [e for e in entries if e["with_frame"]]
+    return {
+        "path": str(state),
+        "corners_seen": seen,
+        "corners_with_frame": with_frame,
+        "dropped_too_few_players": sum(e["dropped"] for e in per_competition.values()),
+        "rate": with_frame / seen,
+        "entries": entries,
+        "uncovered": [e["competition"] for e in entries if not e["with_frame"]],
+        "min": covered[0] if covered else None,
+        "max": covered[-1] if covered else None,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -1499,8 +1661,8 @@ def _threshold_summary(
         f"`RECEIVER_MATCH_MAX_M = {shipped}` in the frozen `setpiece/_io.py` decides which "
         "attacker-first corners get a receiver label at all: the first touch is matched to "
         "the nearest candidate attacker in the freeze frame and the row survives only if that "
-        "candidate is within the threshold. It was a judgement call and had never been "
-        "checked, so the labels here are re-derived at other thresholds from the "
+        "candidate is within the threshold. It is a judgement call rather than a fitted "
+        "number, so the labels here are re-derived at other thresholds from the "
         "`receiver_match_dist` the dataset stores for exactly this purpose, and the *same* "
         "out-of-fold predictions are re-scored against them. Nothing is retrained: this "
         "measures how sensitive the reported numbers are to the threshold, not how sensitive "
@@ -1668,6 +1830,36 @@ def _threshold_notes(
 # --------------------------------------------------------------------------- #
 # out-of-fold predictions on disk
 # --------------------------------------------------------------------------- #
+def rows_digest(rows: Sequence[Row]) -> str:
+    """Content hash of the featurised rows a cached pass was computed from.
+
+    Counting rows and feature columns does not identify a dataset, and both ways
+    of being wrong about that have already happened here. The label windows grew
+    plausibility guards while the row count stayed at 2464, and the featuriser
+    started reflecting every frame about ``y = GOAL_Y`` while the column count
+    stayed put — either change leaves a cache from the old configuration looking
+    reusable under a shape-only signature, which puts numbers from labels or
+    features nobody is running any more straight into `docs/metrics.md`.
+
+    Hashing the tensors and the labels themselves makes both a mismatch. It costs
+    a pass over the featurised rows, which are already in memory by the time a
+    signature is wanted, against a cross-validation pass measured in minutes.
+    """
+    digest = hashlib.blake2b(digest_size=16)
+    for row in rows:
+        digest.update(row.corner_id.encode("utf-8"))
+        digest.update(np.ascontiguousarray(row.graph.x.numpy(), dtype=np.float32).tobytes())
+        digest.update(
+            np.ascontiguousarray(row.graph.edge_attr.numpy(), dtype=np.float32).tobytes()
+        )
+        digest.update(
+            np.asarray(
+                [row.target_pos, float(row.receiver_valid), row.y_shot], dtype=np.float64
+            ).tobytes()
+        )
+    return digest.hexdigest()
+
+
 def oof_signature(
     rows: Sequence[Row], dataset_path: str | Path, folds: int, hp: dict[str, Any]
 ) -> str:
@@ -1677,7 +1869,8 @@ def oof_signature(
     layout and every hyperparameter that touches training are unchanged. Storing
     the signature next to the arrays turns "is this cache stale?" from a judgement
     call into an equality test, so a stale cache raises instead of quietly
-    reporting numbers from a configuration nobody is running any more.
+    reporting numbers from a configuration nobody is running any more. The rows
+    are identified by content — see :func:`rows_digest` — not by their count.
     """
     keys = ("epochs", "hidden", "layers", "dropout", "lr", "weight_decay",
             "batch_size", "baseline_iters", "baseline_lr", "baseline_weight_decay")
@@ -1685,6 +1878,7 @@ def oof_signature(
         {
             "dataset": str(dataset_path),
             "n_rows": len(rows),
+            "rows_digest": rows_digest(rows),
             "folds": int(folds),
             "n_node_features": int(featmod.N_NODE_FEATURES),
             "n_edge_features": int(featmod.N_EDGE_FEATURES),
@@ -1918,6 +2112,146 @@ def _describe_gap(gap: dict[str, Any] | None, winner: str, loser: str, pretty: s
     )
 
 
+def _pct(value: float) -> str:
+    return f"{100.0 * value:.1f}%"
+
+
+def _coverage_paragraph(data: dict[str, Any]) -> list[str]:
+    """What fraction of open-data corners the dataset could have been built from.
+
+    This belongs at the top of the report because it bounds what every number
+    below is about. The dataset is not a sample of corners; it is a sample of
+    corners that came with a freeze frame, and that filter is strongly
+    competition-dependent.
+    """
+    cov = data.get("coverage")
+    if not cov:
+        return []
+    lines = [
+        f"**360 coverage.** {cov['corners_with_frame']} of the "
+        f"{cov['corners_seen']} corners walked came with a 360 freeze frame — "
+        f"{_pct(cov['rate'])} — and that is what the dataset is a sample of. Coverage "
+        "is not uniform across the competitions and is not a property anyone can "
+        "choose: it is whether StatsBomb published a frame."
+    ]
+    if cov.get("min") and cov.get("max") and cov["min"]["competition"] != cov["max"]["competition"]:
+        lines[0] += (
+            f" Among the competitions that ship any frames at all it ranges from "
+            f"{_pct(cov['min']['rate'])} ({cov['min']['competition']}) to "
+            f"{_pct(cov['max']['rate'])} ({cov['max']['competition']})."
+        )
+    if cov.get("uncovered"):
+        names = ", ".join(cov["uncovered"])
+        lines[0] += (
+            f" {names} ships **no** freeze frames despite being flagged for 360 in the "
+            "catalogue, so none of its corners are here at all."
+        )
+    if cov.get("dropped_too_few_players"):
+        lines[0] += (
+            f" A further {cov['dropped_too_few_players']} frames showed fewer than eight "
+            "players and were dropped at load time."
+        )
+    lines.append("")
+    lines.append("| competition | corners with a frame | corners seen | coverage |")
+    lines.append("|---|---|---|---|")
+    for entry in cov["entries"]:
+        lines.append(
+            f"| {entry['competition']} | {entry['with_frame']} | {entry['seen']} | "
+            f"{_pct(entry['rate'])} |"
+        )
+    lines.append("")
+    return lines
+
+
+def _label_paragraph(data: dict[str, Any]) -> list[str]:
+    """How the two labels are defined, and what the plausibility guards caught."""
+    labels = data.get("labels")
+    if not labels:
+        return []
+    counts = labels["first_touch"]
+    dt = labels.get("first_touch_dt") or {}
+    late = labels.get("late_first_touch") or {}
+    lines = [
+        f"**Labels.** First touch: {counts['defender']} defender, "
+        f"{counts['attacker']} attacker, {counts['unknown']} unknown. "
+        f"Shot within five events: base rate {_fmt(data['shot_base_rate'])}."
+    ]
+    if dt and late.get("n"):
+        lines[0] += (
+            " Both windows are **event counts**, per the spec, and an event-count window "
+            "walks straight through a dead ball: it will happily call the restart twelve "
+            "events later the first touch on this corner. They therefore carry "
+            f"plausibility guards — a touch more than {labels['first_touch_max_s']:.0f} s "
+            f"after the delivery, or a shot more than {labels['shot_max_s']:.0f} s after "
+            "it, is discarded. The guards bite. The first touch normally lands a median "
+            f"{dt['median']:.2f} s after the delivery (p90 {dt['p90']:.2f} s), but "
+            f"{late['n']} rows sat beyond the guard, out to {late['max_s']:.0f} s"
+        )
+        base = labels.get("baseline")
+        was = (base or {}).get("late_first_touch_was")
+        if was and was.get("defender"):
+            lines[0] += (
+                f" — and {was['defender']} of them were being scored as *the defence won "
+                "first contact*"
+            )
+        lines[0] += (
+            ". A discarded touch is dropped, never relabelled, which is what the "
+            f"{counts['unknown']}-row `unknown` class is: corners this dataset declines to "
+            "score rather than guesses at."
+        )
+        untimed = counts["unknown"] - late["now_unknown"]
+        if untimed:
+            lines[0] += (
+                f" {untimed} of those {counts['unknown']} carries no timing at all rather "
+                "than a late one, so the guard could not clear it either."
+            )
+    if labels.get("baseline"):
+        base = labels["baseline"]
+        before = base["first_touch"]
+        lines.append("")
+        lines.append(
+            f"Measured against `{base['path']}`, the same corners built without the "
+            "guards, so the guards' effect on the headline numbers is visible rather "
+            "than inferred:"
+        )
+        lines.append("")
+        lines.append("| label | before the guards | after |")
+        lines.append("|---|---|---|")
+        lines.append(
+            f"| first touch: defender | {before['defender']} | {counts['defender']} |"
+        )
+        lines.append(
+            f"| first touch: attacker | {before['attacker']} | {counts['attacker']} |"
+        )
+        lines.append(f"| first touch: unknown | {before['unknown']} | {counts['unknown']} |")
+        lines.append(
+            f"| attacker-first corners with a matched receiver | {base['n_receiver_labels']} | "
+            f"{labels['n_receiver_labels']} |"
+        )
+        lines.append(
+            f"| shot base rate | {_fmt(base['shot_base_rate'])} | "
+            f"{_fmt(data['shot_base_rate'])} |"
+        )
+        lines.append("")
+        lines.append(
+            f"{base['shot_flips']} corners lost their shot label. Every number in this "
+            "file is measured against the guarded labels in the right-hand column."
+        )
+    lines.append("")
+    return lines
+
+
+def format_dataset_markdown(data: dict[str, Any]) -> str:
+    """The "what is this dataset" half of the report: 360 coverage and the labels.
+
+    Split out from :func:`format_metrics_markdown` because it needs no models and
+    no cross-validation, so `analysis/label_audit.py` can print it in seconds
+    rather than after five fits per head per repeat. Sections whose inputs are
+    missing are omitted rather than guessed at.
+    """
+    return "\n".join([*_coverage_paragraph(data), *_label_paragraph(data)])
+
+
 def format_metrics_markdown(report: dict[str, Any]) -> str:
     """Render the full metrics report as markdown."""
     data = report["data"]
@@ -1936,6 +2270,9 @@ def format_metrics_markdown(report: dict[str, Any]) -> str:
         + f". Trained {report['date']}."
     )
     lines.append("")
+    dataset_section = format_dataset_markdown(data)
+    if dataset_section:
+        lines.append(dataset_section)
     lines.append(
         f"Validation is **purged {splits['n_folds']}-fold cross-validation grouped by "
         "`match_id`**: every corner of a match sits in exactly one fold, so no model is "
@@ -1983,6 +2320,17 @@ def format_metrics_markdown(report: dict[str, Any]) -> str:
         lines.append("")
     lines.append("Freeze frames carry no velocities, so every model here is `assume_static`.")
     lines.append("")
+    coordinates = (report.get("features") or {}).get("coordinates")
+    if coordinates:
+        lines.append(
+            f"Features are computed in **mirrored coordinates** — {coordinates}. A corner "
+            "from the left and its mirror image from the right are the same coaching "
+            "situation, so the reflection is a halving of the input space rather than a "
+            "feature: the column count is unchanged. Every number below was measured after "
+            "it, and a checkpoint trained before it has the same feature names and the "
+            "opposite sign convention."
+        )
+        lines.append("")
 
     lines.append("## receiver head")
     lines.append("")
@@ -1997,14 +2345,32 @@ def format_metrics_markdown(report: dict[str, Any]) -> str:
     )
     lines.append("")
     if dropped > 0:
+        counts = (data.get("labels") or {}).get("first_touch") or {}
+        unknown = int(counts.get("unknown", 0))
+        off_camera = dropped - unknown
+        breakdown = (
+            f"{off_camera} are attacker-first corners whose receiver was not visible in the "
+            f"freeze frame, so there is no node to point at, and {unknown} are the `unknown` "
+            "class — corners whose only candidate first touch fell outside the plausibility "
+            "guard, so there is no label to point at either"
+            if unknown
+            else "almost all of them attacker-first corners whose receiver was not visible in "
+            "the freeze frame, so there is no node to point at"
+        )
+        share = (
+            1.0 - receiver["gnn"]["n_attacker_first"] / receiver["gnn"]["n_rows"]
+            if receiver["gnn"]["n_rows"]
+            else float("nan")
+        )
         lines.append(
-            f"The other {dropped} corners carry no usable receiver label — almost all of them "
-            "attacker-first corners whose receiver was not visible in the freeze frame, so "
-            "there is no node to point at. That filter removes attacker-first rows far more "
-            "often than defence-wins rows, which leaves the scored subset more defence-heavy "
-            "than the dataset as a whole. All three models are scored on exactly these rows, "
-            "so the columns compare cleanly against each other, but the overall-accuracy and "
-            "defence-AUC figures are not population estimates."
+            f"The other {dropped} corners carry no usable receiver label: {breakdown}. "
+            "Neither filter is neutral — both remove attacker-first rows far more often than "
+            "defence-wins rows — so the scored subset is more defence-heavy than the dataset "
+            f"as a whole ({_fmt(share)} against "
+            f"{_fmt(counts.get('defender', 0) / data['n_corners']) if counts else 'n/a'}). All "
+            "three models are scored on exactly these rows, so the columns compare cleanly "
+            "against each other, but the overall-accuracy and defence-AUC figures are not "
+            "population estimates."
         )
         lines.append("")
     lines.append(
@@ -2068,6 +2434,20 @@ def format_metrics_markdown(report: dict[str, Any]) -> str:
             key=lambda k: subset[k].get(key, float("-inf")),
         )
         gap = _paired_gap(report, family, key, winners[0], runner_up)
+        runner_value = subset[runner_up].get(key, float("nan"))
+        if _fmt(value) == _fmt(runner_value):
+            # One model is ahead in a decimal this table does not print. Saying it
+            # "wins, ahead of the other" beside two identical numbers reads as a
+            # typo; the paired gap beside it is the honest statement either way.
+            lines.append(
+                f"- {MODEL_LABELS[winners[0]]} and {MODEL_LABELS[runner_up]} are level on "
+                f"{pretty} at {_fmt(value)}, to the precision this table prints."
+                + _describe_gap(
+                    gap, f"the {MODEL_LABELS[winners[0]]}", f"the {MODEL_LABELS[runner_up]}",
+                    pretty,
+                )
+            )
+            continue
         if winners[0] == "gnn":
             lines.append(
                 f"- The GNN wins on {pretty} ({_fmt(value)}), ahead of the "
@@ -2091,9 +2471,82 @@ def format_metrics_markdown(report: dict[str, Any]) -> str:
     )
     lines.append("")
 
+    lines.extend(_ablation_section(report))
     lines.extend(_calibration_section(report))
     lines.extend(_threshold_section(report))
     return "\n".join(lines)
+
+
+def _ablation_section(report: dict[str, Any]) -> list[str]:
+    """Attribution of a change in the table above to the change that caused it.
+
+    Rendered from the JSON `analysis/ablation.py` writes, when a run was given
+    one. It is not recomputed here: each cell of the comparison is a full
+    cross-validation pass over a *different* dataset or featuriser, so only the
+    caller knows which passes are the right ones to line up.
+    """
+    stored = report.get("ablation")
+    if not stored:
+        return []
+    runs = [stored] if isinstance(stored, dict) else list(stored)
+    runs = [a for a in runs if a.get("steps")]
+    if not runs:
+        return []
+    lines = [
+        "## what moved, and why",
+        "",
+        "More than one thing changed under the table above, so a single before-and-after "
+        "cannot say which of them did what. Each column below is the same protocol — same "
+        "seeds, same folds, same hyperparameters — run over one configuration. A step "
+        "between two columns is differenced *within* each seed, so the shared split draw "
+        "cancels, and is read against its own spread exactly like the model comparisons "
+        "above.",
+        "",
+    ]
+    for ablation in runs:
+        cells = list(next(iter(ablation["table"].values())).keys())
+        model = ablation["model"]
+        lines.append(
+            f"### `{model}`"
+            + (
+                ", the gap itself, differenced inside each seed before anything else"
+                if "-" in model
+                else ""
+            )
+        )
+        lines.append("")
+        lines.append("| metric | " + " | ".join(cells) + " |")
+        lines.append("|" + "---|" * (len(cells) + 1))
+        for metric, row in ablation["table"].items():
+            lines.append(f"| {metric} | " + " | ".join(row[c] for c in cells) + " |")
+        lines.append("")
+        by_step: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for step in ablation["steps"]:
+            by_step.setdefault((step["from"], step["to"]), []).append(step)
+        for (before, after), group in by_step.items():
+            lines.append(f"**{before} → {after}.**")
+            if not group[0].get("same_rows", True):
+                lines.append("")
+                lines.append(
+                    "The labels differ between these two columns, so they are not scored on "
+                    "the same rows. This step is the change in the reported number, not a "
+                    "model improvement — a metric can move here because the question changed."
+                )
+            lines.append("")
+            lines.append("| metric | step | its own spread | ratio | reading |")
+            lines.append("|---|---|---|---|---|")
+            for step in group:
+                verdict = (
+                    "outside the noise floor"
+                    if step["ratio"] >= DECISIVE_RATIO
+                    else "**inside the noise floor**"
+                )
+                lines.append(
+                    f"| {step['metric']} | {step['mean']:+.4f} | ±{step['sd']:.4f} | "
+                    f"{step['ratio']:.1f}x | {verdict} |"
+                )
+            lines.append("")
+    return lines
 
 
 def _calibration_section(report: dict[str, Any]) -> list[str]:
@@ -2267,6 +2720,8 @@ def train_all(
     calibrate: bool = True,
     sweep_threshold: bool = True,
     cache_dir: str | Path | None = None,
+    label_baseline: str | Path | None = None,
+    ablation: str | Path | Sequence[str | Path] | None = None,
 ) -> dict[str, Any]:
     """Cross-validate both heads, evaluate the baselines, then fit and save.
 
@@ -2286,6 +2741,18 @@ def train_all(
     With ``install``, the two refitted checkpoints are also copied over the
     bundled ones in ``setpiece/assets/``, which is what ``score``, ``suggest``,
     ``demo`` and the app load by default.
+
+    ``label_baseline`` is an optional build of the same corners from before the
+    label windows grew their plausibility guards. It changes no number in the
+    tables; it only lets the report say which class each guarded row used to
+    carry, which a guarded dataset cannot recover on its own. See
+    :func:`label_window_summary`.
+
+    ``ablation`` is the JSON `analysis/ablation.py` writes, or several of them —
+    one per model or per differenced pair of models. It changes no number either;
+    it carries an attribution of a change in this table to the change that caused
+    it, which needs cross-validation passes over configurations this run is not
+    the one to compute.
 
     Returns the report dict: ``data``, ``splits``, ``receiver``, ``shot``,
     ``spread``, ``seeds``, ``calibration``, ``label_threshold``, ``params``,
@@ -2395,7 +2862,11 @@ def train_all(
         "competitions": sorted({r.competition for r in rows if r.competition}),
         "seasons": sorted({r.season for r in rows if r.season}),
         "shot_base_rate": float(y_shot.mean()),
+        "labels": label_window_summary(rows, baseline_path=label_baseline),
     }
+    coverage = coverage_summary(dataset_path)
+    if coverage is not None:
+        data_summary["coverage"] = coverage
     training = {
         "folds": n_folds,
         "epochs": epochs,
@@ -2432,6 +2903,9 @@ def train_all(
         report["calibration"] = calibration
     if label_threshold is not None:
         report["label_threshold"] = label_threshold
+    if ablation:
+        paths = [ablation] if isinstance(ablation, str | Path) else list(ablation)
+        report["ablation"] = [json.loads(Path(p).read_text()) for p in paths]
 
     feature_card = {
         "node_features": list(featmod.FEATURE_NAMES),
@@ -2440,7 +2914,15 @@ def train_all(
         "n_edge_features": featmod.N_EDGE_FEATURES,
         "excluded": ["meta.end_xy", "meta.pass_outcome"],
         "note": "positional only; freeze frames carry no velocities",
+        # Recorded because it changes what the columns mean, not how many there
+        # are: a checkpoint trained before the reflection and one trained after
+        # have identical feature names and incompatible sign conventions.
+        "coordinates": (
+            "reflected about y = GOAL_Y so the corner is always taken from the "
+            "y < GOAL_Y side; every signed y feature is in those coordinates"
+        ),
     }
+    report["features"] = feature_card
 
     out_dir.mkdir(parents=True, exist_ok=True)
     paths: dict[str, str] = {}
@@ -2568,6 +3050,20 @@ def add_train_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
         "regenerated without retraining",
     )
     parser.add_argument(
+        "--label-baseline",
+        default=None,
+        help="a build of the same corners from before the label windows grew their "
+        "plausibility guards. Changes no metric; it only lets the report say which class "
+        "each guarded row used to carry, which the guarded dataset cannot recover alone",
+    )
+    parser.add_argument(
+        "--ablation",
+        action="append",
+        default=None,
+        help="JSON written by analysis/ablation.py, attributing a change in this table to "
+        "the change that caused it. Changes no number; adds a section. Repeatable",
+    )
+    parser.add_argument(
         "--no-calibrate",
         action="store_true",
         help="skip the calibration measurement; it costs three extra fits per head",
@@ -2616,6 +3112,8 @@ def run_from_args(args: argparse.Namespace) -> int:
         calibrate=not getattr(args, "no_calibrate", False),
         sweep_threshold=not getattr(args, "no_threshold_sweep", False),
         cache_dir=getattr(args, "cache_dir", None),
+        label_baseline=getattr(args, "label_baseline", None),
+        ablation=getattr(args, "ablation", None),
     )
     return 0
 

@@ -43,7 +43,51 @@ N_EDGE_FEATURES: int
 def build_graph(frame: CornerFrame) -> CornerData: ...
 def build_flat(frame: CornerFrame) -> np.ndarray:  # [N, N_NODE_FEATURES], baseline use
 def global_receiver_index(data) -> Tensor: ...     # int64 [B], -1 passed through
+def mirror_side(frame: CornerFrame) -> float: ...  # +1.0 or -1.0
+def taker_position(frame: CornerFrame) -> tuple[float, float]: ...
 ```
+
+### Mirrored coordinates
+
+Every frame is reflected about the pitch's long axis, `y = GOAL_Y`, so the
+corner is always taken from the `y < GOAL_Y` side. A corner from the left and
+its mirror image from the right are the **same coaching situation** — same near
+post, same far post, same runs, same marking — and without the reflection the
+network has to learn each half of the pitch separately from half the data.
+
+`mirror_side(frame)` returns `+1.0` when the corner already comes from
+`y < GOAL_Y` and `-1.0` otherwise; the side is decided by `taker_position`,
+which reads the taker flag when the frame has one and otherwise infers the
+nearest corner flag (user CSV input). The reflection is applied **once, to the
+coordinates**, before any feature is computed. Distances, densities, adjacency
+and the box flags are already invariant under it; every signed `y` quantity —
+`y_norm`, `dy_goal`, `goal_angle_sin`, `taker_angle_sin`, the edge `dy` —
+inherits the flip from the coordinates rather than carrying its own sign rule,
+so node and edge features can never disagree about which way is which.
+
+Consequences, all asserted in `tests/test_features.py`:
+
+- `build_graph` is **exactly** invariant to reflection about `y = GOAL_Y`:
+  measured over all 2464 corners in `data/interim/corners.jsonl`, max absolute
+  difference **0.0** in both `x` and `edge_attr`, with `edge_index` identical.
+  The dataset is well split between the flags, 1161 near / 1303 far.
+- `N_NODE_FEATURES` and `N_EDGE_FEATURES` are unchanged; this is a change of
+  coordinates, not extra columns.
+- Player order, team flags and labels are untouched. `y_receiver` still indexes
+  the same node.
+- **Degenerate cases where invariance cannot hold**, both documented in the
+  source and both unreachable from a real corner: a taker exactly on
+  `y == GOAL_Y` (side `+1.0`, frame left alone — the frame and its mirror put
+  the taker on the same line and so choose the same side, which no taker-based
+  rule can avoid), and, on the no-taker-flag fallback, a player set exactly
+  symmetric about `y = GOAL_Y`, where both flags are equidistant and the
+  tie-break picks the same one for a frame and its mirror. Both still produce
+  finite, well-formed features.
+
+A fixture whose taker sits at `y < GOAL_Y` is reflected by the identity, so
+assertions written against one stay green whether or not the mirror runs at all.
+Geometry tests are therefore parametrised over a near-side **and** a far-side
+fixture and state their expectations in mirrored coordinates.
 
 `CornerData` is a `torch_geometric.data.Data` **subclass** that pins
 `__inc__("y_receiver") == 0`, so `y_receiver` survives batching as a
@@ -76,9 +120,14 @@ centre; the angle subtended by the two posts; distance to the taker; and local
 density (count of any player within 3 m and within 5 m). Distances are in metres
 and should be scaled to roughly unit range before entering the network.
 
+All of them are computed in the mirrored coordinates above, so `y` and the
+signed angles are "distance from the taker's touchline", not "distance from
+`y = 0`".
+
 Edges: fully connected within a radius, or k-nearest-neighbour with k around 8,
 plus edges to the taker. `edge_attr` carries at least relative `dx`, `dy`,
-distance, and a same-team flag.
+distance, and a same-team flag — `dy` in the same mirrored coordinates as the
+node features, from the same reflected positions.
 
 `build_graph` must work on a frame with **no labels** (inference path): in that
 case `y_receiver = -1`, `y_receiver_valid = False`, `y_shot = 0.0`.
@@ -196,8 +245,15 @@ what `score`, `suggest`, `demo` and the app load by default.
 
 `app` must pin `torch.set_num_threads(1)` inside `app.py`'s own `main()`. It is
 launched as a fresh `streamlit run` subprocess, so no setting made in `cli.py`
-reaches it, and at torch's default thread count a `suggest()` call takes 2.5-2.9 s
-against 0.6 s pinned — which breaks the under-1-second interaction budget.
+reaches it. The pin is worth about 0.2 s: measured on the 22-player frame from
+the dataset with the bundled `shot.pt`, five repeats each at a one-minute load
+average of 16-21, a default `suggest()` runs in a median 0.69 s at torch's own
+default of four threads and 0.45 s pinned to one. An earlier note here claimed
+2.5-2.9 s at the default; that was machine contention and does not reproduce.
+The pin stays because it is free, provably takes effect (asserted in
+`tests/test_app.py` against a real second interpreter) and keeps the editor off
+the other cores — not because the interaction budget is close to breaking. An
+`OMP_NUM_THREADS` or `MKL_NUM_THREADS` the user set explicitly wins.
 
 `main(argv=None) -> int`. `demo` runs on the three bundled Euro 2024 corners in
 `setpiece/assets/demo/`, offline, in under 10 s, and must not touch the network.

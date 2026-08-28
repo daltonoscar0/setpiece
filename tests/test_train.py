@@ -10,6 +10,7 @@ corners so it stays fast; the real smoke dataset is used when it is present.
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -554,6 +555,239 @@ def test_rows_carry_pooled_features(tmp_path: Path) -> None:
     assert np.isfinite(row.pooled).all()
 
 
+# --------------------------------------------------------------------------- #
+# what the dataset is: label windows and 360 coverage
+# --------------------------------------------------------------------------- #
+def guarded_dataset(path: Path) -> tuple[Path, Path]:
+    """A pair of builds of the same corners, one before the guards and one after.
+
+    The two differ only in the way the real pair does: a first touch recorded far
+    outside ``FIRST_TOUCH_MAX_S`` is a class in the unguarded build and
+    ``"unknown"`` in the guarded one, and a shot recorded outside ``SHOT_MAX_S``
+    is dropped. Nothing here re-derives the label from the timing; both files are
+    written the way ``_io`` would have written them.
+    """
+    before: list[CornerFrame] = []
+    after: list[CornerFrame] = []
+    for i in range(8):
+        late = i < 3  # three corners whose "first touch" is a different phase of play
+        dt = 120.0 if late else 1.5
+        base = make_frame(
+            f"c{i}", match_id=100 + i // 2, seed=i, first_touch="defender", receiver_slot=None
+        )
+        before.append(
+            CornerFrame(
+                **{
+                    **base.__dict__,
+                    "shot_within_5": late,
+                    "meta": {**base.meta, "first_touch_dt": dt, "shot_dt": dt},
+                }
+            )
+        )
+        after.append(
+            CornerFrame(
+                **{
+                    **base.__dict__,
+                    "first_touch": "unknown" if late else "defender",
+                    "shot_within_5": False,
+                    "meta": {**base.meta, "first_touch_dt": dt, "shot_dt": dt},
+                }
+            )
+        )
+    guarded, unguarded = path / "after.jsonl", path / "before.jsonl"
+    write_corners(after, guarded)
+    write_corners(before, unguarded)
+    return guarded, unguarded
+
+
+def test_label_summary_counts_what_the_guard_caught(tmp_path: Path) -> None:
+    guarded, _ = guarded_dataset(tmp_path)
+    summary = trainmod.label_window_summary(load_rows(guarded))
+    assert summary["first_touch"] == {"defender": 5, "attacker": 0, "unknown": 3}
+    assert summary["late_first_touch"]["n"] == 3
+    assert summary["late_first_touch"]["now_unknown"] == 3
+    assert summary["late_first_touch"]["max_s"] == pytest.approx(120.0)
+    assert summary["first_touch_dt"]["median"] == pytest.approx(1.5)
+    assert "baseline" not in summary
+
+
+def test_only_a_pre_guard_build_can_say_which_class_a_guarded_row_used_to_carry(
+    tmp_path: Path,
+) -> None:
+    """The guarded dataset records *that* a touch was implausible, not whose it was."""
+    guarded, unguarded = guarded_dataset(tmp_path)
+    rows = load_rows(guarded)
+    assert "baseline" not in trainmod.label_window_summary(rows)
+
+    summary = trainmod.label_window_summary(rows, baseline_path=unguarded)
+    assert summary["baseline"]["first_touch"] == {"defender": 8, "attacker": 0, "unknown": 0}
+    assert summary["baseline"]["late_first_touch_was"]["defender"] == 3
+    assert summary["baseline"]["shot_flips"] == 3
+    assert summary["baseline"]["shot_base_rate"] == pytest.approx(3 / 8)
+
+
+def test_the_report_prints_the_guarded_labels_and_names_the_before_and_after(
+    tmp_path: Path,
+) -> None:
+    guarded, unguarded = guarded_dataset(tmp_path)
+    report = train_all(
+        guarded, tmp_path / "out", folds=2, epochs=1, hidden=8, layers=2, batch_size=8,
+        baseline_iters=5, seeds=1, calibrate=False, sweep_threshold=False,
+        metrics_path=None, quiet=True, label_baseline=unguarded,
+    )
+    markdown = trainmod.format_metrics_markdown(report)
+    assert "3 unknown" in markdown
+    assert "plausibility guards" in markdown
+    assert "| first touch: unknown | 0 | 3 |" in markdown
+    # the guards are the reason the unknown class exists, and the report says so
+    assert "never relabelled" in markdown
+    # the card a checkpoint ships carries the same composition
+    _, card = load_model(tmp_path / "out" / "shot.pt")
+    assert card["data"]["labels"]["first_touch"]["unknown"] == 3
+
+
+def test_the_report_and_the_cards_record_the_coordinate_convention(tmp_path: Path) -> None:
+    """A checkpoint from before the reflection has identical feature names.
+
+    Nothing about the shape of the input distinguishes the two conventions, so
+    the only thing that can is a written record travelling with the weights.
+    """
+    path = make_dataset(tmp_path / "d.jsonl", matches=4, per_match=2)
+    report = train_all(
+        path, tmp_path / "out", folds=2, epochs=1, hidden=8, layers=2, batch_size=8,
+        baseline_iters=5, seeds=1, calibrate=False, sweep_threshold=False,
+        metrics_path=None, quiet=True,
+    )
+    assert "y = GOAL_Y" in report["features"]["coordinates"]
+    assert "mirrored coordinates" in trainmod.format_metrics_markdown(report)
+    for name in ("receiver", "shot"):
+        _, card = load_model(tmp_path / "out" / f"{name}.pt")
+        assert "y = GOAL_Y" in card["features"]["coordinates"]
+        assert card["features"]["n_node_features"] == len(card["features"]["node_features"])
+
+
+def test_the_report_omits_the_before_and_after_when_no_baseline_was_given(
+    tmp_path: Path,
+) -> None:
+    guarded, _ = guarded_dataset(tmp_path)
+    report = train_all(
+        guarded, tmp_path / "out", folds=2, epochs=1, hidden=8, layers=2, batch_size=8,
+        baseline_iters=5, seeds=1, calibrate=False, sweep_threshold=False,
+        metrics_path=None, quiet=True,
+    )
+    markdown = trainmod.format_metrics_markdown(report)
+    assert "3 unknown" in markdown
+    assert "before the guards" not in markdown
+
+
+def test_coverage_folds_seasons_into_competitions_and_finds_the_empty_ones(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    dataset = tmp_path / "corners.jsonl"
+    make_dataset(dataset, matches=2, per_match=2)
+    (tmp_path / "corners.state.json").write_text(
+        json.dumps(
+            {
+                "coverage": {
+                    "Ligue 1 2021/2022": {"corners_seen": 100, "corners_with_frame": 40,
+                                          "dropped_too_few_players": 1},
+                    "Ligue 1 2022/2023": {"corners_seen": 100, "corners_with_frame": 60,
+                                          "dropped_too_few_players": 0},
+                    "La Liga 2020/2021": {"corners_seen": 50, "corners_with_frame": 40,
+                                          "dropped_too_few_players": 0},
+                    "African Cup of Nations 2023": {"corners_seen": 60,
+                                                    "corners_with_frame": 0,
+                                                    "dropped_too_few_players": 0},
+                }
+            }
+        )
+    )
+    cov = trainmod.coverage_summary(dataset)
+    assert (cov["corners_seen"], cov["corners_with_frame"]) == (310, 140)
+    assert cov["rate"] == pytest.approx(140 / 310)
+    assert cov["dropped_too_few_players"] == 1
+    # the two Ligue 1 seasons are one row, at their pooled rate
+    assert {e["competition"]: e["with_frame"] for e in cov["entries"]}["Ligue 1"] == 100
+    # a competition that ships no frames is named, and never becomes the "worst covered"
+    assert cov["uncovered"] == ["African Cup of Nations"]
+    assert cov["min"]["competition"] == "Ligue 1"
+    assert cov["max"]["competition"] == "La Liga"
+
+
+def test_the_ablation_section_separates_a_step_that_changed_the_rows(tmp_path: Path) -> None:
+    """Two columns with different labels are not scored on the same rows.
+
+    Reporting such a step as though it were a model improvement is the exact
+    mistake the section exists to prevent, so it has to be marked in the output.
+    """
+    import json
+
+    payload = {
+        "model": "gnn",
+        "table": {
+            "receiver top-1": {"before": "0.4254 ±0.0035", "mirrored": "0.4300 ±0.0040"},
+            "shot AUC": {"before": "0.5768 ±0.0149", "mirrored": "0.5800 ±0.0150"},
+        },
+        "steps": [
+            {"from": "before", "to": "mirrored", "metric": "receiver top-1",
+             "mean": 0.0046, "sd": 0.0010, "ratio": 4.6, "same_rows": False},
+            {"from": "before", "to": "mirrored", "metric": "shot AUC",
+             "mean": 0.0032, "sd": 0.0090, "ratio": 0.4, "same_rows": False},
+        ],
+    }
+    section = "\n".join(trainmod._ablation_section({"ablation": [payload]}))
+    assert "## what moved, and why" in section
+    assert "### `gnn`" in section
+    assert "| metric | before | mirrored |" in section
+    assert "| receiver top-1 | +0.0046 | ±0.0010 | 4.6x | outside the noise floor |" in section
+    assert "| shot AUC | +0.0032 | ±0.0090 | 0.4x | **inside the noise floor** |" in section
+    assert "not scored on the same rows" in section
+
+    # a step that kept the rows carries no such warning, and so is readable as a
+    # model comparison rather than as a change of question
+    same = {**payload, "steps": [{**s, "same_rows": True} for s in payload["steps"]]}
+    assert "not scored on the same rows" not in "\n".join(trainmod._ablation_section(
+        {"ablation": [same]}
+    ))
+
+    # a differenced pair is labelled as the gap it is, not as a third model
+    gap = {**payload, "model": "gnn-logreg"}
+    assert "the gap itself" in "\n".join(trainmod._ablation_section({"ablation": [gap]}))
+
+    # and it reaches the report from the flag rather than being recomputed there
+    path = tmp_path / "ablation.json"
+    path.write_text(json.dumps(payload))
+    gap_path = tmp_path / "ablation-gap.json"
+    gap_path.write_text(json.dumps({**payload, "model": "gnn-logreg"}))
+    dataset = make_dataset(tmp_path / "d.jsonl", matches=4, per_match=2)
+    report = train_all(
+        dataset, tmp_path / "out", folds=2, epochs=1, hidden=8, layers=2, batch_size=8,
+        baseline_iters=5, seeds=1, calibrate=False, sweep_threshold=False,
+        metrics_path=None, quiet=True, ablation=[path, gap_path],
+    )
+    assert [a["model"] for a in report["ablation"]] == ["gnn", "gnn-logreg"]
+    markdown = trainmod.format_metrics_markdown(report)
+    assert "### `gnn`" in markdown and "### `gnn-logreg`" in markdown
+
+
+def test_the_ablation_section_is_absent_when_no_attribution_was_supplied() -> None:
+    assert trainmod._ablation_section({}) == []
+    empty = {"model": "gnn", "table": {}, "steps": []}
+    assert trainmod._ablation_section({"ablation": [empty]}) == []
+
+
+def test_coverage_is_absent_rather_than_guessed_when_there_is_no_ledger(
+    tmp_path: Path,
+) -> None:
+    """A corner with no frame never became a row, so nothing can reconstruct this."""
+    dataset = make_dataset(tmp_path / "corners.jsonl", matches=2, per_match=2)
+    assert trainmod.coverage_summary(dataset) is None
+    (tmp_path / "corners.state.json").write_text('{"n_corners": 4}')
+    assert trainmod.coverage_summary(dataset) is None
+
+
 @pytest.mark.slow
 def test_smoke_dataset_trains(tmp_path: Path) -> None:
     if not SMOKE.exists():
@@ -758,6 +992,43 @@ def test_the_table_says_plainly_when_a_baseline_beats_the_gnn() -> None:
     assert "mean over 2 repeats" in text
 
 
+def test_a_lead_too_small_to_print_is_called_level_rather_than_a_win() -> None:
+    """Two models can differ in a decimal the table does not show.
+
+    "The GNN wins (0.432), ahead of the baseline at 0.432" reads as a typo and
+    invites the reader to believe in a lead the numbers beside it do not support.
+    """
+    report = _report_with_spread(
+        {
+            "gnn": {"auc": [0.5802, 0.5806]},
+            "logreg": {"auc": [0.5799, 0.5801]},
+            "heuristic": {"auc": [0.48, 0.49]},
+        }
+    )
+    report.update(
+        {
+            "date": "2026-01-01",
+            "data": {"path": "d.jsonl", "n_corners": 10, "n_matches": 3, "competitions": []},
+            "splits": {"n_folds": 2, "rows_per_fold": [5, 5], "matches_per_fold": [2, 1]},
+            "params": {"receiver": 1, "shot": 1},
+            "training": {"seed": 0, "torch_threads": 1},
+            "seeds": [0, 1000],
+        }
+    )
+    for model in trainmod.MODEL_KEYS:
+        report["receiver"][model].update({"n_rows": 10.0, "n_attacker_first": 4.0})
+        report["shot"][model].update({"n_rows": 10.0, "base_rate": 0.3})
+    report["receiver"]["chance"] = {"top1_attacker": 0.2, "top3_attacker": 0.5}
+    report["receiver"]["always_defence_accuracy"] = 0.6
+
+    text = trainmod.format_metrics_markdown(report)
+    assert "GNN and logistic regression are level on shot AUC at 0.580" in text
+    assert "wins on shot AUC" not in text
+    assert "**beats** the GNN on shot AUC" not in text
+    # the paired gap is still reported, and is still the honest reading
+    assert "Seed by seed, the GNN minus the logistic regression on shot AUC" in text
+
+
 # --------------------------------------------------------------------------- #
 # cross-validation results and the out-of-fold cache
 # --------------------------------------------------------------------------- #
@@ -841,6 +1112,51 @@ def test_oof_signature_moves_with_anything_that_changes_the_predictions(
         bumped = dict(hp)
         bumped[key] = hp[key] * 2
         assert base != trainmod.oof_signature(rows, "d.jsonl", 5, bumped), key
+
+
+def test_oof_signature_moves_when_the_labels_change_under_a_fixed_row_count(
+    tmp_path: Path,
+) -> None:
+    """The label windows grew guards without the row count or feature width moving.
+
+    A shape-only signature calls that cache reusable and reports numbers measured
+    against labels nobody is using any more, which is the worst kind of stale:
+    silent and plausible.
+    """
+    rows = load_rows(make_dataset(tmp_path / "d.jsonl", matches=4, per_match=2))
+    hp = dict(trainmod.DEFAULTS)
+    base = trainmod.oof_signature(rows, "d.jsonl", 5, hp)
+
+    relabelled = [*rows]
+    relabelled[0] = replace(rows[0], y_shot=1.0 - rows[0].y_shot)
+    assert len(relabelled) == len(rows)
+    assert trainmod.oof_signature(relabelled, "d.jsonl", 5, hp) != base
+
+    moved = [*rows]
+    moved[0] = replace(rows[0], target_pos=-1, receiver_valid=False)
+    assert trainmod.oof_signature(moved, "d.jsonl", 5, hp) != base
+
+
+def test_oof_signature_moves_when_the_features_change_under_a_fixed_column_count(
+    tmp_path: Path,
+) -> None:
+    """The mirror change altered every signed ``y`` feature and no column count."""
+    rows = load_rows(make_dataset(tmp_path / "d.jsonl", matches=4, per_match=2))
+    hp = dict(trainmod.DEFAULTS)
+    base = trainmod.oof_signature(rows, "d.jsonl", 5, hp)
+
+    refeaturised = [*rows]
+    graph = rows[0].graph.clone()
+    graph.x = graph.x + 0.5
+    refeaturised[0] = replace(rows[0], graph=graph)
+    assert refeaturised[0].graph.x.shape == rows[0].graph.x.shape
+    assert trainmod.oof_signature(refeaturised, "d.jsonl", 5, hp) != base
+
+    edged = [*rows]
+    graph = rows[0].graph.clone()
+    graph.edge_attr = graph.edge_attr + 0.5
+    edged[0] = replace(rows[0], graph=graph)
+    assert trainmod.oof_signature(edged, "d.jsonl", 5, hp) != base
 
 
 def test_cached_cross_validate_trains_once_and_then_reuses(
@@ -1365,9 +1681,15 @@ def test_parser_exposes_the_repeat_count_and_the_cache(tmp_path: Path) -> None:
     assert args.cache_dir is None
     assert args.no_calibrate is False
 
+    assert args.label_baseline is None
+    assert args.ablation is None
+
     args = parser.parse_args(
-        ["--seeds", "3", "--cache-dir", "runs/oof", "--no-calibrate", "--no-threshold-sweep"]
+        ["--seeds", "3", "--cache-dir", "runs/oof", "--no-calibrate", "--no-threshold-sweep",
+         "--label-baseline", "data/interim/before.jsonl", "--ablation", "runs/ablation.json"]
     )
     assert (args.seeds, args.cache_dir) == (3, "runs/oof")
     assert args.no_calibrate is True
     assert args.no_threshold_sweep is True
+    assert args.label_baseline == "data/interim/before.jsonl"
+    assert args.ablation == ["runs/ablation.json"]
