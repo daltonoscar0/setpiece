@@ -21,7 +21,7 @@ Contents:
 13. [Exit codes and errors](#13-exit-codes-and-errors)
 
 Throughout: coordinates are **metres on a 105x68 pitch, attacking towards +x**,
-the goal being attacked is at `(105, 34)`, and every model is `assume_static` —
+the goal being attacked is at `(105, 34)`, and every model is `assume_static` -
 freeze frames carry no velocities and none are invented.
 
 ---
@@ -309,7 +309,7 @@ static repositioning at the moment of the delivery; no player is assumed to cove
 `delta` is `new_prob - base_prob`, so negative is an improvement, and
 suggestions are ranked best first. The player numbers are the row indices from
 the scored table, which are the CSV rows in order starting at 0, so `#13` is
-`defend,94.0,32.0` — the fourteenth data row.
+`defend,94.0,32.0`, the fourteenth data row.
 
 **What that `-0.047` is worth.** `docs/search-objective.md` measures exactly
 this on 400 real corners, and the answer is narrow: a searched move beats a
@@ -322,7 +322,7 @@ a bootstrap interval containing zero, and the shipped head calls 60% of
 direction as a weak signal and the number as one model's opinion about a shape
 no match ever produced.
 
-The search enforces its constraints internally — only defenders move, at most
+The search enforces its constraints internally, only defenders move, at most
 `--movers` of them, each displacement at most `--max-move` metres, no two
 players end up closer than 0.5 m to each other (attackers and unmoved defenders
 included), and nobody leaves the pitch. It is deterministic: the same corner,
@@ -412,8 +412,8 @@ expose it:
 | `--move-keeper` | off | lets the goalkeeper into the movable pool |
 | `--max-evals N` | sized from the layout | ceiling on shot-model evaluations |
 
-The pretty output prints the width actually used on every run — the
-`search width:` line above — and the JSON records it under `params`, so a
+The pretty output prints the width actually used on every run, the
+`search width:` line above, and the JSON records it under `params`, so a
 suggestion always says how hard it looked.
 
 ```
@@ -433,7 +433,7 @@ static repositioning at the moment of the delivery; no player is assumed to cove
 
 Note the budget: `setpiece suggest` sizes `--max-evals` from the widths you
 asked for, so widening the flags really does widen the search rather than
-silently truncating it. Set `--max-evals` yourself to buy latency back — the
+silently truncating it. Set `--max-evals` yourself to buy latency back, the
 search degrades gracefully, expanding states in beam-rank order and stopping
 when the budget runs out. The library is stricter about this than the CLI:
 calling `suggest(..., max_candidates=None)` while leaving `max_evals` at its
@@ -516,11 +516,11 @@ ships none, and one match whose upstream file is malformed JSON. That match has
 one recorded failure; `build_dataset` gives up on a match after `max_attempts`
 (default 3) and stops re-downloading it, updating its `failures` row in place
 rather than appending a duplicate on every pass. `max_attempts` is a keyword
-argument to `setpiece.fetch.build_dataset`, **not** a CLI flag — from
+argument to `setpiece.fetch.build_dataset`, **not** a CLI flag, from
 `setpiece fetch` the cap is fixed at 3. See `TODO.md`.
 
 The `coverage` entry in the same file is where the 360 coverage numbers in
-`docs/metrics.md` come from — `corners_seen`, `corners_with_frame` and
+`docs/metrics.md` come from, `corners_seen`, `corners_with_frame` and
 `dropped_too_few_players` per season, which is how "55.2% of open-data corners
 have a frame" became a measurement rather than an estimate.
 
@@ -533,8 +533,8 @@ it to take about an hour, most of it waiting politely.
 uv run setpiece train
 ```
 
-That runs 5-fold cross-validation purged by `match_id` — every corner of a match
-lands in one fold — evaluates the GNN heads against both baselines on identical
+That runs 5-fold cross-validation purged by `match_id`, every corner of a match
+lands in one fold, evaluates the GNN heads against both baselines on identical
 held-out rows, **repeats the whole protocol over five seeds and reports
 `mean ±sd`**, measures calibration and the receiver-label threshold sweep, refits
 on all the data, prints the metrics table, writes it to `docs/metrics.md`, and
@@ -557,7 +557,7 @@ $ uv run setpiece train --dataset data/interim/smoke.jsonl --out-dir runs/smoke 
 Parameters: receiver 118,082, shot 97,601.
 ```
 
-Those numbers are meaningless — 18 corners, seven of them attacker-first — and
+Those numbers are meaningless, 18 corners, seven of them attacker-first, and
 are shown only to demonstrate the command. `--no-metrics-file` is what keeps a
 run like that from overwriting the real `docs/metrics.md`; use it for anything
 you do not intend to publish.
@@ -617,7 +617,7 @@ P(shot within 5): 0.281
 a candidate (defenders and the taker). `card` is the model card: the
 competitions and seasons trained on, the 360 coverage ledger, the split scheme,
 the measured metrics with their five-seed spreads under `metrics_spread`, the
-calibrator (`{"kind": "identity"}` on both heads — nothing improved held-out
+calibrator (`{"kind": "identity"}` on both heads, nothing improved held-out
 ECE, so neither ships one), the feature list, the parameter count, the thread
 count it was trained at, the date, and `assume_static: True`. The features list
 carries an `excluded` entry naming `meta.end_xy` and `meta.pass_outcome`, which
@@ -641,10 +641,10 @@ layout wants, which is how `DEFAULT_MAX_EVALS = 288` was derived.
 uv run python -m pytest
 ```
 
-430 passed, 1 skipped. Six tests carry the `slow` marker — the training
+430 passed, 1 skipped. Six tests carry the `slow` marker, the training
 reproducibility check, the smoke-dataset training run, the nested-calibration
 check, the inference benchmark, and the two `app.py` thread-pinning tests that
-each spawn a second interpreter — so an edit loop can skip them:
+each spawn a second interpreter, so an edit loop can skip them:
 
 ```
 uv run python -m pytest -m "not slow"

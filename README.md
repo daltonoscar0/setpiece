@@ -6,9 +6,9 @@ events, then searches for small defensive repositionings that lower that shot
 probability. The models are graph neural networks over StatsBomb 360 freeze
 frames from the public open-data release.
 
-- `setpiece score` — per-player probability of first contact, plus P(shot).
-- `setpiece suggest` — ranked defender adjustments, each at most 3 m.
-- `setpiece app` — a Streamlit pitch editor: drag a player, re-score on drop.
+- `setpiece score`, per-player probability of first contact, plus P(shot).
+- `setpiece suggest`, ranked defender adjustments, each at most 3 m.
+- `setpiece app`, a Streamlit pitch editor: drag a player, re-score on drop.
 
 Everything runs on CPU. Scoring one corner with both heads takes about 6 ms
 (measured over the 18 corners in `data/interim/smoke.jsonl`, single-threaded, on
@@ -28,12 +28,12 @@ uv sync --extra app     # adds streamlit + plotly, needed only for `setpiece app
 ```
 
 Python 3.11 or 3.12. Trained checkpoints are committed under
-`setpiece/assets/`, so scoring works straight after `uv sync` — no download and
+`setpiece/assets/`, so scoring works straight after `uv sync`, no download and
 no training needed.
 
 ## Quickstart
 
-### 1. `demo` — three real Euro 2024 corners, offline
+### 1. `demo`, three real Euro 2024 corners, offline
 
 ```
 uv run setpiece demo
@@ -46,7 +46,7 @@ warm run at roughly 5 s end to end.
 One caveat worth knowing: the very first run in a freshly created venv pays a
 one-off cost to page torch in from disk, and that run has been measured between
 46 s and 60 s on a clean clone here, dropping to about 5 s once warm. That is a
-property of importing torch, not of the model — inference itself is a few
+property of importing torch, not of the model, inference itself is a few
 milliseconds per corner. Abridged output:
 
 ```
@@ -92,7 +92,7 @@ scored and searched 3 corners in 0.5s (plus 4.9s to import torch and load the ch
 `--format json` and `--format csv` are available on `demo`, `score` and
 `suggest`.
 
-### 2. `score` — one corner of your own
+### 2. `score`, one corner of your own
 
 Write the shape to a CSV (columns and units are in
 [Input formats](#input-formats) below) and score it:
@@ -101,7 +101,7 @@ Write the shape to a CSV (columns and units are in
 uv run setpiece score corner.csv
 ```
 
-### 3. `suggest` — what to change
+### 3. `suggest`, what to change
 
 ```
 uv run setpiece suggest corner.csv --movers 2 --top-k 3
@@ -117,7 +117,7 @@ seed, same output.
 **What a `suggest` delta means.** `docs/search-objective.md` measures this on
 400 real corners, and the answer is narrow. A searched move beats a random legal
 move under every second model tested (p between 1e-06 and 1e-73), so the
-direction is a real signal — but the *number* does not transfer. The
+direction is a real signal, but the *number* does not transfer. The
 cross-family correlation between the searching model's delta and a logistic
 regression's delta on the same moved frame is +0.10 with a bootstrap 95%
 interval containing zero, only 21% of the claimed improvement is visible to that
@@ -126,10 +126,10 @@ pick the same three defenders on 7% of corners, and the shipped head calls 60%
 of *arbitrary* legal defender moves an improvement, median -0.0038. So a
 `-0.06` on the CLI is worth roughly `-0.012` to `-0.018` to an equally
 defensible model. Read the direction, not the magnitude, and never read it as a
-measured change in a real shot probability — nothing in this dataset labels what
+measured change in a real shot probability, nothing in this dataset labels what
 would have happened had a defender stood two metres to his left.
 
-### 4. `app` — the pitch editor
+### 4. `app`, the pitch editor
 
 ```
 uv sync --extra app
@@ -198,7 +198,7 @@ Two things are accepted wherever a command takes `<corner>`:
 `teammate`, `actor` and `keeper` map to attacker, taker and goalkeeper, and the
 120x80 StatsBomb coordinates are rescaled to metres at the loader boundary.
 `setpiece`'s own serialisation (`{"corner_id": ..., "players": [...]}`) is
-accepted too, as is a whole `.jsonl` or `.ndjson` dataset — every corner in the
+accepted too, as is a whole `.jsonl` or `.ndjson` dataset, every corner in the
 file is scored.
 
 **Plain CSV.** Columns `team,x,y,is_taker` with an optional `is_keeper`:
@@ -216,14 +216,14 @@ towards +x.** The goal being attacked is centred at `(105, 34)`, its posts at
 `(105, 68)`.
 
 Flag exactly one attacker as the taker. If nothing is flagged, the delivery
-origin falls back to whichever corner flag is nearest to the shape — a
-geometric inference, never an invented player — but the unflagged taker is then
+origin falls back to whichever corner flag is nearest to the shape, a
+geometric inference, never an invented player, but the unflagged taker is then
 treated as an ordinary attacker and will be scored as a candidate receiver,
 which is wrong and obvious in the output.
 
 ### A worked example
 
-Save this as `corner.csv` — a delivery from the flag at `(105, 68)`, six
+Save this as `corner.csv`, a delivery from the flag at `(105, 68)`, six
 attackers arriving in front of goal plus the taker, ten defenders including the
 keeper on his line:
 
@@ -319,11 +319,11 @@ players are dropped at load time; over the full walk that discarded 4 corners.
 **Just over half of open-data corners have a frame, and this is now measured
 rather than guessed.** The fetch ledger counts corners seen against corners
 kept: **2468 of the 4467 corners walked came with a 360 freeze frame, 55.2%**.
-Coverage is not uniform and is not something anyone here can choose — it is
+Coverage is not uniform and is not something anyone here can choose, it is
 whether StatsBomb published a frame. Among competitions that ship any frames at
 all it runs from **43.9% (Major League Soccer) to 76.0% (La Liga)**. African Cup
 of Nations 2023 is flagged `match_available_360` in the catalogue and ships
-**no** freeze frames at all — 0% of its 460 corners — so none of it is in the
+**no** freeze frames at all, 0% of its 460 corners, so none of it is in the
 dataset. The per-competition table is in `docs/metrics.md`. Corners without a
 frame are skipped entirely and the models never see them.
 
@@ -343,7 +343,7 @@ headline receiver comparison does not rest on it.
 
 **Both label windows are event counts, and both carry a plausibility guard.**
 `first_touch` is the first genuine touch in a 12-event lookahead and
-`shot_within_5` a 5-event window, per the spec — but an event-count window walks
+`shot_within_5` a 5-event window, per the spec, but an event-count window walks
 straight through a dead ball and will happily call the restart twelve events
 later "the first touch on this corner". So a touch more than 10 s after the
 delivery (`FIRST_TOUCH_MAX_S`) or a shot more than 15 s after it (`SHOT_MAX_S`)
@@ -351,7 +351,7 @@ is discarded. The guards bite: the first touch normally lands a median 1.61 s
 after the delivery (p90 2.53 s), but 110 rows sat beyond the guard, out to
 238 s, and 102 of those were being scored as *the defence won first contact*. A
 discarded touch is dropped, never relabelled, which is what the 111-corner
-`unknown` class is — corners this dataset declines to score rather than guesses
+`unknown` class is, corners this dataset declines to score rather than guesses
 at. The event-count definition itself survives the check: replacing the 5-event
 shot window with a 5-second one flips 2.3% of the shot labels, so the two rules
 **agree on 97.7% of corners**.
@@ -370,7 +370,7 @@ the app all print the raw sigmoid. `setpiece/calibration.py` has the machinery
 and `docs/metrics.md` the reliability tables if you want to fit your own.
 
 **The suggestion search is a search over one model's opinion.** It optimises the
-GNN shot head over counterfactual frames — shapes no match ever produced — and
+GNN shot head over counterfactual frames, shapes no match ever produced, and
 cross-validated AUC says nothing about that surface, because every row AUC is
 measured on is a shape some team really made. `docs/search-objective.md`
 measures what survives a second opinion; the summary is in "What a `suggest`
@@ -395,7 +395,7 @@ models can be compared like for like.
 
 Rows where the attack won the first contact but the positional match was
 ambiguous (`receiver_match_dist > 8 m`) are dropped, not relabelled. So is the
-attacking team's own goalkeeper taking the first touch — that is scored as
+attacking team's own goalkeeper taking the first touch, that is scored as
 `"defender"`, deliberately, since an attacking keeper is not receiving his own
 corner.
 
@@ -411,8 +411,8 @@ to 2025.
 
 Split scheme: **purged 5-fold cross-validation grouped by `match_id`**. Every
 corner of a match sits in exactly one fold, so no model is scored on a match it
-trained on. The numbers are pooled out-of-fold predictions — each corner scored
-exactly once — and both baselines are fitted on the same training folds and
+trained on. The numbers are pooled out-of-fold predictions, each corner scored
+exactly once, and both baselines are fitted on the same training folds and
 scored on the same held-out rows as the GNN. Folds hold 83 matches each; rows
 per fold are [493, 493, 493, 493, 492].
 
@@ -433,8 +433,8 @@ is a tighter test than eyeballing two columns.
 Scored on 2238 corners with a usable receiver label, of which 918 were won by an
 attacker. The other 226 are corners nobody can score: 115 attacker-first corners
 whose receiver was not visible in the frame, and the 111 `unknown` rows the
-plausibility guards removed. Neither filter is neutral — both drop attacker-first
-rows far more often than defence-wins rows — so the scored subset is more
+plausibility guards removed. Neither filter is neutral, both drop attacker-first
+rows far more often than defence-wins rows, so the scored subset is more
 defence-heavy than the dataset as a whole (0.590 against 0.536). All three
 models are scored on exactly these rows, so the columns compare cleanly against
 each other, but the overall-accuracy and defence-AUC figures are **not**
@@ -453,7 +453,7 @@ everyone); always predicting "defence wins" scores 0.590 overall.
 ### Shot head
 
 Binary `shot_within_5`, scored on all 2464 held-out corners, base rate 0.268.
-The heuristic is the training-fold shot rate — a constant within a fold, so it
+The heuristic is the training-fold shot rate, a constant within a fold, so it
 carries no information about an individual corner and is here as the floor. Its
 0.481 sits below 0.5 for a mechanical reason rather than by chance: the
 training-fold rate is a strictly decreasing function of the held-out fold's own
@@ -493,8 +493,8 @@ baseline "beats" the GNN on shot AUC on the strength of a single run; with five
 repeats that gap is 0.1x its own spread, which is not a result. The message
 passing is not buying anything measurable over a pooled linear model here.
 
-The shot head is weak in absolute terms besides — 0.584 AUC on a 0.268 base
-rate — and `setpiece suggest` optimises it anyway, because that is the model
+The shot head is weak in absolute terms besides, 0.584 AUC on a 0.268 base
+rate, and `setpiece suggest` optimises it anyway, because that is the model
 wired into the search. `docs/search-objective.md` explains why swapping to a
 0.002-AUC-different objective would be dressing an arbitrary choice as a
 finding, and measures what a delta is worth regardless.
@@ -531,7 +531,7 @@ Data provided by StatsBomb.
 ## Screenshots
 
 Both images below are produced by the app's own PNG export (`render_png`), so
-they are exactly what the export button writes — same drawing, same header. They
+they are exactly what the export button writes, same drawing, same header. They
 were exported before the current checkpoints were fitted, so the probabilities
 printed in them are that model's, not today's; the drawing is what is being
 shown.
@@ -552,8 +552,8 @@ rather than as an image, so it stays copy-pasteable and greppable.
 
 ## Documentation
 
-- `docs/usage.md` — an end-to-end walkthrough with real commands and output.
-- `docs/architecture.md` — the module contract.
-- `docs/metrics.md` — the measured numbers, regenerated by `setpiece train`.
-- `docs/search-objective.md` — what a `suggest` delta is worth, measured.
-- `TODO.md` — known gaps, shortcuts and things that are not finished.
+- `docs/usage.md`, an end-to-end walkthrough with real commands and output.
+- `docs/architecture.md`, the module contract.
+- `docs/metrics.md`, the measured numbers, regenerated by `setpiece train`.
+- `docs/search-objective.md`, what a `suggest` delta is worth, measured.
+- `TODO.md`, known gaps, shortcuts and things that are not finished.

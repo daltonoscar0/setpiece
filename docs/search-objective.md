@@ -33,7 +33,7 @@ What survives the reframing is the second half of the entry, and it was always
 the more serious half: *no experiment has checked that the suggested moves
 survive being re-scored by a different model.* A search does not evaluate a
 model's ranking of real corners. It evaluates the model's response to
-**counterfactual frames that do not exist in any dataset** — a defender moved
+**counterfactual frames that do not exist in any dataset**, a defender moved
 2.6 m north-east, a shape no match ever produced. Out-of-fold AUC says nothing
 about that surface, because every row it is measured on is a real frame. Two
 models can rank real corners identically and still disagree completely about
@@ -58,12 +58,12 @@ checkpoints use, at `torch.set_num_threads(1)`:
 
 | id | what it is |
 |---|---|
-| `gnn_a` | the shipped `setpiece/assets/shot.pt` — `ShotModel`, `head="linear"`, 97,601 parameters, seed 0 |
+| `gnn_a` | the shipped `setpiece/assets/shot.pt`, `ShotModel`, `head="linear"`, 97,601 parameters, seed 0 |
 | `gnn_b` | the same architecture, hyperparameters and rows, seed 4321 |
 | `logreg` | the shipped shot baseline: logistic regression on the pooled flat node features, 400 Adam iterations, lr 0.05, weight decay 1e-3 |
 
-They share their training data. That is deliberate — it isolates the second
-opinion to a change of family or a change of seed — but it means everything
+They share their training data. That is deliberate, it isolates the second
+opinion to a change of family or a change of seed, but it means everything
 below is an **upper bound** on how much two genuinely independent models would
 agree. A second opinion trained on different matches would agree less, not more.
 
@@ -72,7 +72,7 @@ closely on the *unmodified* frames:
 
 | | mean | sd | Pearson vs `gnn_a` | Spearman vs `gnn_a` |
 |---|---|---|---|---|
-| `gnn_a` | 0.3149 | 0.0611 | — | — |
+| `gnn_a` | 0.3149 | 0.0611 |, |, |
 | `gnn_b` | 0.2145 | 0.0808 | 0.764 | 0.740 |
 | `logreg` | 0.2683 | 0.0913 | 0.616 | 0.576 |
 
@@ -96,7 +96,7 @@ movable defenders (keeper excluded), each given one displacement drawn uniformly
 from the identical 16-member candidate set `candidate_displacements(3.0, 0)`,
 rejected unless it keeps every pair at least 0.5 m apart and stays on the pitch.
 8000 draws in all. A robustness variant restricts the draw to the six defenders
-nearest the goal — the pool the search itself can reach — and is reported below.
+nearest the goal, the pool the search itself can reach, and is reported below.
 
 ## 1. search against the GNN, re-score with something else
 
@@ -137,7 +137,7 @@ Symmetrical, and just as weak. Note the row that looks wrong and is not: under
 `gnn_a`, random legal moves are called an improvement on 0.755 of corners while
 the logistic regression's own best suggestion manages 0.730. Sign agreement is
 worthless as a statistic here precisely because the GNN thinks almost any
-perturbation helps — see the next section.
+perturbation helps, see the next section.
 
 Neither direction is better than the other. Whichever head does the searching,
 the other family recovers roughly a seventh of what it thinks was available on
@@ -151,7 +151,7 @@ that frame:
 And they largely do not name the same players. Mean Jaccard overlap of the moved
 defender sets is **0.419**; the two searches choose an identical set of three
 defenders on **7.2%** of corners, though on 100% of corners they share at least
-one — which is mostly the candidate restriction talking, since both draw from
+one, which is mostly the candidate restriction talking, since both draw from
 the same six defenders nearest the goal.
 
 ## 3. the null, which is the part that matters
@@ -173,7 +173,7 @@ looks good to this network". That alone is a reason not to read a `suggest`
 delta as a coaching result.
 
 Against that null, the searched moves do win. Expressed as the suggestion's
-percentile among its own corner's 20 random draws — 0.500 would mean
+percentile among its own corner's 20 random draws, 0.500 would mean
 indistinguishable from random, 0.000 means it beat every draw:
 
 | searched against | judged by `gnn_a` | judged by `gnn_b` | judged by `logreg` |
@@ -184,7 +184,7 @@ indistinguishable from random, 0.000 means it beat every draw:
 Read the diagonal first: under its own objective the search is emphatic, beating
 99.5% of random draws. Read the off-diagonal second. **Under the logistic
 regression, a random legal move set beats the GNN's best suggestion 39.1% of the
-time** — against the 50% it would manage if the search carried no cross-family
+time**, against the 50% it would manage if the search carried no cross-family
 information whatever. Put the other way round: on **90.5%** of corners at least
 one of twenty random draws beats the GNN's suggestion in the logistic
 regression's eyes. Under its own model that happens on 7.7%.
@@ -203,12 +203,12 @@ The paired comparisons are still significant, so the honest verdict is *not*
 
 **Robustness of the null.** Drawing the random defenders from all ten movable
 ones gives the search a possible unfair edge, because the search only ever
-considers the six nearest the goal. Repeating the null restricted to those six —
-the search's own pool — changes nothing that matters:
+considers the six nearest the goal. Repeating the null restricted to those six -
+the search's own pool, changes nothing that matters:
 
 | judged by | matched-pool random median | all-defender random median | searched (`gnn_a`) beats matched-pool median |
 |---|---|---|---|
-| `gnn_a` | -0.00490 | -0.00378 | — |
+| `gnn_a` | -0.00490 | -0.00378 |, |
 | `gnn_b` | -0.00053 | -0.00075 | 0.920 (p = 1.7e-73) |
 | `logreg` | -0.00026 | +0.00131 | 0.660 (p = 1.5e-10) |
 
@@ -221,14 +221,14 @@ to the search.
 | what the searching model claims | what `gnn_b` sees | what `logreg` sees |
 |---|---|---|
 | `gnn_a`: -0.05920 | -0.01760 (**30%**) | -0.01214 (**21%**) |
-| `logreg`: -0.08756 | -0.00712 (**8%**) | — |
+| `logreg`: -0.08756 | -0.00712 (**8%**) |, |
 
 Net of the random-move baseline the surviving excess is -0.0168 (28% of the
 claim) for `gnn_b` and -0.0135 (23%) for `logreg`.
 
 Scale matters as much as sign. The GNN's median searched delta is 0.97 of its
-*own* spread across real corners — a full standard deviation, which is why the
-CLI prints an impressive-looking number — but only 0.22 of `gnn_b`'s spread and
+*own* spread across real corners, a full standard deviation, which is why the
+CLI prints an impressive-looking number, but only 0.22 of `gnn_b`'s spread and
 0.13 of `logreg`'s. A suggestion that moves the shipped head by a whole standard
 deviation moves an equally good model by a tenth of one.
 
@@ -272,7 +272,7 @@ the ensemble stays out.
 
 ## why a better ranker is not automatically a better search target
 
-At the time of writing there is no "better ranker" to promote — the shot AUCs
+At the time of writing there is no "better ranker" to promote, the shot AUCs
 are 0.584 ±0.014 and 0.586 ±0.009, differing by 0.1x their spread. But the
 argument matters independently of which way that gap points, so it is recorded
 here rather than left implicit:
@@ -342,11 +342,11 @@ with `torch.set_num_threads(1)`, then `suggest()` at the defaults and
 uses `candidate_displacements(3.0, 0)` and the same admissibility rule as
 `setpiece.suggest._admissible`; `tests/test_suggest.py` carries a checked
 implementation of the draw and asserts it produces only legal move sets, and
-asserts the control result — that the search beats every random draw under its
+asserts the control result, that the search beats every random draw under its
 own objective.
 
 Cost, for planning: fitting `gnn_b` took 57 s, the 400-corner main run 159 s
 (0.40 s per corner for two searches plus 108 re-scorings), the ensemble arm
 146 s and the matched-pool null 21 s. All single-threaded on a 10-core machine
-whose 1-minute load average sat between 4.0 and 6.1 throughout — several other
+whose 1-minute load average sat between 4.0 and 6.1 throughout, several other
 jobs were running, so treat these as upper bounds rather than benchmarks.

@@ -139,7 +139,7 @@ def _edges(p: np.ndarray, bins: int, strategy: str) -> np.ndarray:
         edges = np.unique(np.quantile(p, qs))
         # A head that emits few distinct values collapses quantile edges. A
         # constant score collapses them to a single value, which is not an edge
-        # array at all — widening `edges[0]` and `edges[-1]` in place would then
+        # array at all, widening `edges[0]` and `edges[-1]` in place would then
         # write to the same element twice and leave zero bins, so every row would
         # fall outside the curve and the error would come back `nan` rather than
         # the zero it actually is. Keep the ends open, and keep at least one bin.

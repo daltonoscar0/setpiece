@@ -372,8 +372,8 @@ def _row_from_frame(frame: CornerFrame) -> Row:
             target_pos = int(hits[0])
 
     is_attacker = np.asarray([p.is_attacker for p in frame.players], dtype=bool)
-    # Grouping key for the purged split. A corner with no ``match_id`` — user CSV
-    # and ad-hoc JSON inputs carry none — becomes its own singleton group rather
+    # Grouping key for the purged split. A corner with no ``match_id``, user CSV
+    # and ad-hoc JSON inputs carry none, becomes its own singleton group rather
     # than joining one shared bucket, because collapsing them would put every
     # unlabelled corner in a single fold. The consequence is that such corners
     # are *not* purged against each other: if two of them come from the same
@@ -2047,7 +2047,7 @@ MODEL_LABELS: dict[str, str] = {
 MODEL_ORDER: tuple[str, ...] = ("gnn", "logreg", "heuristic")
 
 #: A gap has to be this many times the spread of its own paired difference before
-#: the table calls it real. Two is deliberately modest — it is a readability rule
+#: the table calls it real. Two is deliberately modest, it is a readability rule
 #: for a five-repeat sample, not a significance test.
 DECISIVE_RATIO: float = 2.0
 

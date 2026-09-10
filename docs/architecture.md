@@ -2,7 +2,7 @@
 
 Module contract. Every module below owns its files exclusively; nothing else in
 the package may edit them. `setpiece/types.py`, `setpiece/_io.py` and
-`setpiece/fetch.py` are frozen — read them, import them, do not modify them.
+`setpiece/fetch.py` are frozen, read them, import them, do not modify them.
 
 ## Coordinates and conventions
 
@@ -30,7 +30,7 @@ the attack (measured: 10 defender / 8 attacker on a 18-corner sample).
 - **Shot head** is binary: `shot_within_5`.
 
 `CornerFrame.meta["end_xy"]` is the delivery destination. It is **label-adjacent
-and must never be used as a model feature** — it is present for diagnostics only.
+and must never be used as a model feature**, it is present for diagnostics only.
 The same goes for `meta["pass_outcome"]`.
 
 ## `setpiece/features.py`
@@ -51,8 +51,8 @@ def taker_position(frame: CornerFrame) -> tuple[float, float]: ...
 
 Every frame is reflected about the pitch's long axis, `y = GOAL_Y`, so the
 corner is always taken from the `y < GOAL_Y` side. A corner from the left and
-its mirror image from the right are the **same coaching situation** — same near
-post, same far post, same runs, same marking — and without the reflection the
+its mirror image from the right are the **same coaching situation**, same near
+post, same far post, same runs, same marking, and without the reflection the
 network has to learn each half of the pitch separately from half the data.
 
 `mirror_side(frame)` returns `+1.0` when the corner already comes from
@@ -60,8 +60,8 @@ network has to learn each half of the pitch separately from half the data.
 which reads the taker flag when the frame has one and otherwise infers the
 nearest corner flag (user CSV input). The reflection is applied **once, to the
 coordinates**, before any feature is computed. Distances, densities, adjacency
-and the box flags are already invariant under it; every signed `y` quantity —
-`y_norm`, `dy_goal`, `goal_angle_sin`, `taker_angle_sin`, the edge `dy` —
+and the box flags are already invariant under it; every signed `y` quantity -
+`y_norm`, `dy_goal`, `goal_angle_sin`, `taker_angle_sin`, the edge `dy` -
 inherits the flip from the coordinates rather than carrying its own sign rule,
 so node and edge features can never disagree about which way is which.
 
@@ -77,7 +77,7 @@ Consequences, all asserted in `tests/test_features.py`:
   the same node.
 - **Degenerate cases where invariance cannot hold**, both documented in the
   source and both unreachable from a real corner: a taker exactly on
-  `y == GOAL_Y` (side `+1.0`, frame left alone — the frame and its mirror put
+  `y == GOAL_Y` (side `+1.0`, frame left alone, the frame and its mirror put
   the taker on the same line and so choose the same side, which no taker-based
   rule can avoid), and, on the no-taker-flag fallback, a player set exactly
   symmetric about `y = GOAL_Y`, where both flags are equidistant and the
@@ -95,7 +95,7 @@ fixture and state their expectations in mirrored coordinates.
 `batch.ptr[b] + batch.y_receiver[b]`; use `global_receiver_index(batch)`, which
 does that and passes the `-1` sentinel through unshifted. There is no `__inc__`
 formulation that both shifts real indices and preserves `-1`, because PyG applies
-graph `b`'s increment from the cumulative sum of graphs `0..b-1` — a
+graph `b`'s increment from the cumulative sum of graphs `0..b-1`, a
 value-dependent increment silently turns `-1` into a valid-looking node index.
 
 `build_graph` returns a `Data` with exactly these attributes:
@@ -126,7 +126,7 @@ signed angles are "distance from the taker's touchline", not "distance from
 
 Edges: fully connected within a radius, or k-nearest-neighbour with k around 8,
 plus edges to the taker. `edge_attr` carries at least relative `dx`, `dy`,
-distance, and a same-team flag — `dy` in the same mirrored coordinates as the
+distance, and a same-team flag, `dy` in the same mirrored coordinates as the
 node features, from the same reflected positions.
 
 `build_graph` must work on a frame with **no labels** (inference path): in that
@@ -218,10 +218,10 @@ Hard constraints, which the tests assert:
 - at most `movers` defenders move (**defenders only**; attackers never move);
 - each displacement has euclidean length `<= max_move` (3 m) **within floating
   point tolerance**;
-- no two players end up closer than `min_sep` (0.5 m) — check against **all**
+- no two players end up closer than `min_sep` (0.5 m), check against **all**
   players, moved and unmoved, attackers included;
 - moved players stay on the pitch;
-- deterministic given `seed` — same inputs produce identical output ordering.
+- deterministic given `seed`, same inputs produce identical output ordering.
 
 `defend=True` minimises shot probability. The search is greedy with a beam.
 Return suggestions ranked by `delta` ascending (best improvement first).
@@ -252,7 +252,7 @@ default of four threads and 0.45 s pinned to one. An earlier note here claimed
 2.5-2.9 s at the default; that was machine contention and does not reproduce.
 The pin stays because it is free, provably takes effect (asserted in
 `tests/test_app.py` against a real second interpreter) and keeps the editor off
-the other cores — not because the interaction budget is close to breaking. An
+the other cores, not because the interaction budget is close to breaking. An
 `OMP_NUM_THREADS` or `MKL_NUM_THREADS` the user set explicitly wins.
 
 `main(argv=None) -> int`. `demo` runs on the three bundled Euro 2024 corners in

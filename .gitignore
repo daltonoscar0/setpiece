@@ -16,3 +16,11 @@ data/processed/
 # training outputs (bundled demo models live in setpiece/assets/)
 runs/
 *.ckpt
+CLAUDE.md
+AGENTS.md
+.claude/
+.agentnotes/
+.cursor/
+.mcp.json
+tasks/lessons.md
+tasks/todo.md

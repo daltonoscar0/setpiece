@@ -465,7 +465,7 @@ def test_taker_exactly_on_the_centre_line_is_left_unreflected() -> None:
     for i, p in enumerate(players):
         assert g.x[i, col].item() == pytest.approx(p.y / PITCH_WIDTH, abs=1e-6)
 
-    # its mirror is also left alone, so the two differ — stated, not hidden
+    # its mirror is also left alone, so the two differ, stated, not hidden
     h = build_graph(reflect(frame))
     assert mirror_side(reflect(frame)) == 1.0
     assert not torch.equal(g.x, h.x)
@@ -487,8 +487,8 @@ def test_taker_just_either_side_of_the_centre_line() -> None:
     assert mirror_side(with_taker(GOAL_Y - 1e-3)) == 1.0
     assert mirror_side(with_taker(GOAL_Y + 1e-3)) == -1.0
 
-    # and a taker only half a metre off the line — an offset that reflects
-    # exactly in binary, so the two featurisations are bit-identical — is still
+    # and a taker only half a metre off the line, an offset that reflects
+    # exactly in binary, so the two featurisations are bit-identical, is still
     # mirrored like any other corner
     near = with_taker(GOAL_Y - 0.5)
     assert mirror_side(near) == 1.0

@@ -550,7 +550,7 @@ def load_model(path: str | Path) -> tuple[nn.Module, dict]:
     if name == "ShotModel" and "head" not in kwargs:
         # The shot head used to be a two-layer MLP and was not configurable, so
         # it was not recorded either. Every checkpoint missing the key therefore
-        # holds the MLP head — the absence is what dates it, not a guess — and
+        # holds the MLP head, the absence is what dates it, not a guess, and
         # rebuilding it with today's default would fail on the state dict.
         kwargs["head"] = "mlp"
     model = _REGISTRY[name](**kwargs)

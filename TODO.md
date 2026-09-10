@@ -43,7 +43,7 @@ corners from 415 matches across 8 competitions, out of 476 matches walked.
   `three-sixty/<match_id>.json` file exists for it: 51 processed matches
   yielded zero freeze frames, and a three-match sample returned 404 for every
   three-sixty URL. The 51 matches are therefore absent from the dataset, and so
-  are all 460 of their corners — 0% coverage, the only competition at zero. The
+  are all 460 of their corners, 0% coverage, the only competition at zero. The
   catalogue flag cannot be trusted on its own; `fetch_match_corners` reports
   the real answer through `report["has_360"]`.
 - **Match 3845506 could not be parsed.** Its three-sixty file is malformed JSON
@@ -59,7 +59,7 @@ corners from 415 matches across 8 competitions, out of 476 matches walked.
 - ~~The overall 360 coverage of open-data corners has never been measured.~~
   Measured, during the fetch, per season, into the state file. `corners_seen`
   against `corners_with_frame` over the whole walk: **2468 of 4467 corners came
-  with a 360 freeze frame, 55.2%**. It is not uniform — 0.0% for African Cup of
+  with a 360 freeze frame, 55.2%**. It is not uniform, 0.0% for African Cup of
   Nations, then 43.9% (Major League Soccer), 52.7% (FIFA World Cup), 53.0%
   (Ligue 1), 56.3% (UEFA Euro), 67.4% (Women's World Cup), 68.3% (UEFA Women's
   Euro), 70.4% (1. Bundesliga), 76.0% (La Liga). The per-competition table is in
@@ -94,7 +94,7 @@ corners from 415 matches across 8 competitions, out of 476 matches walked.
   threshold; loosening it for real needs a re-fetch.
 - ~~Both label windows are event counts, not seconds, so they stretch and shrink
   with how densely the match was tagged. A time-based window would be better
-  defined.~~ Checked, and the event-count definition stands — but it now carries
+  defined.~~ Checked, and the event-count definition stands, but it now carries
   a plausibility guard, because an event-count window walks straight through a
   dead ball and will call a restart twelve events later "the first touch on this
   corner". `FIRST_TOUCH_MAX_S = 10.0` and `SHOT_MAX_S = 15.0` in `_io.py`
@@ -107,17 +107,17 @@ corners from 415 matches across 8 competitions, out of 476 matches walked.
   time-versus-event question itself: replacing the 5-event shot window with a
   5-second one flips 2.3% of the shot labels, so the two rules **agree on 97.7%
   of the 2464 corners** and there is no case for changing the definition. That
-  comparison is only available in one direction — a shot more than twelve events
-  away but within five seconds is not recoverable from the stored dataset — so it
+  comparison is only available in one direction, a shot more than twelve events
+  away but within five seconds is not recoverable from the stored dataset, so it
   is a bound on the disagreement, not a full audit.
 - The attacking team's own goalkeeper taking the first touch is scored as
-  `"defender"`. That is deliberate — an attacking keeper is not receiving his
-  own corner — but it does put a handful of odd rows in the defence class.
+  `"defender"`. That is deliberate, an attacking keeper is not receiving his
+  own corner, but it does put a handful of odd rows in the defence class.
 
 ## modelling
 
 - ~~The logistic-regression baseline beats the GNN on the shot head and on the
-  defence-wins AUC; the GNN only wins the receiver ranking.~~ Dead as stated —
+  defence-wins AUC; the GNN only wins the receiver ranking.~~ Dead as stated -
   those were single-run gaps quoted to three decimals. On the 5-repeat protocol
   in `docs/metrics.md`, differenced within each seed so the shared split noise
   cancels, **every GNN-versus-logistic gap is inside its own noise floor**:
@@ -128,7 +128,7 @@ corners from 415 matches across 8 competitions, out of 476 matches walked.
   shown to earn its keep.** A pooled logistic regression on the same flat node
   features matches it on all four numbers with a fifth to a tenth of the spread
   and a fraction of the training cost. The message passing is not measurably
-  buying anything, and the shot head is weak in absolute terms besides — 0.584
+  buying anything, and the shot head is weak in absolute terms besides, 0.584
   ±0.014 AUC on a 0.268 base rate. Things worth trying, none of them tried:
   delivery-side and near/far-post structure as explicit features, a shared
   encoder trained jointly on both heads, class weighting, and simply more data
@@ -164,17 +164,17 @@ corners from 415 matches across 8 competitions, out of 476 matches walked.
   figure in `docs/metrics.md` is now `mean ±sd` across those repeats. Model
   comparisons are differenced *within* each repeat before averaging, which
   cancels the shared split draw. The underlying cause is unchanged and still
-  documented — torch's parallel reductions sum in thread-partition order, so
+  documented, torch's parallel reductions sum in thread-partition order, so
   training at `OMP_NUM_THREADS=4` and at `1` gives different weights
   (state-dict digests `561b3c60…` and `d0e77a07…`) while two runs at the same
-  count are bit-identical — but it is now inside the reported spread instead of
+  count are bit-identical, but it is now inside the reported spread instead of
   being an unquantified caveat. Everything ships trained at
   `torch.set_num_threads(1)`, recorded in each card as `training.torch_threads`.
 - ~~`setpiece suggest` optimises the weaker head, and no experiment has checked
   that the suggested moves survive being re-scored by a different model.~~ Both
   halves closed, in `docs/search-objective.md`, on 400 corners against a
   same-architecture-different-seed model and a logistic regression. There is no
-  longer a "weaker head" — the shot AUCs differ by 0.1x their spread. On
+  longer a "weaker head", the shot AUCs differ by 0.1x their spread. On
   transfer, the answer is uncomfortable and is now stated in `README.md` next to
   the `suggest` example: the search beats a random legal move under every foreign
   model tested (p between 1e-06 and 1e-73), but cross-family delta correlation is
@@ -221,7 +221,7 @@ corners from 415 matches across 8 competitions, out of 476 matches walked.
   single-threaded, one-minute load 13-31), the shipped 6/2 width reaches a median
   best delta of -0.061 against the -0.080 an every-defender search finds, so the
   **median cost of the default is 0.015 of shot probability** (mean 0.018, worst
-  0.064) and the narrow search ties or wins on only 2% of corners — for which the
+  0.064) and the narrow search ties or wins on only 2% of corners, for which the
   wide search charges **3.5x the wall time** (208.0 s against 60.1 s for the same
   100 corners). Given what `docs/search-objective.md` says a delta is worth to a
   second model, buying 0.015 of one model's opinion for 3.5x the latency is not
@@ -250,14 +250,14 @@ corners from 415 matches across 8 competitions, out of 476 matches walked.
   now says so. Note the sharp edge: `--install` will happily overwrite good
   checkpoints with a smoke run, so pair it with a real `--dataset`.
 - ~~There is no `LICENSE` file.~~ Added, MIT, with an explicit note that the
-  StatsBomb Public Data User Agreement — not MIT — governs the downloaded data,
+  StatsBomb Public Data User Agreement, not MIT, governs the downloaded data,
   the bundled demo corners and the trained checkpoints.
 - ~~Screenshots are not in the tree.~~ `assets/pitch-editor.png` and
   `assets/suggest-overlay.png` are committed and referenced from `README.md`.
   Both come from the app's own `render_png` export path, so they are the real
   drawing rather than a mock-up. Two things still missing. First, a screenshot of
   the live Streamlit UI *as a page* (browser chrome, sidebar, the canvas
-  mid-drag) — that needs a browser and was not capturable in the environment this
+  mid-drag), that needs a browser and was not capturable in the environment this
   was built in. Second, **both images were exported before the current
   checkpoints were fitted**, so the probabilities printed in them (21.4% base,
   -0.039 delta on the suggest overlay) are the old model's and no longer match
@@ -267,7 +267,7 @@ corners from 415 matches across 8 competitions, out of 476 matches walked.
 - ~~`setpiece demo` meets the ten second budget in process but takes about 11 s
   wall clock through `uv run`.~~ Re-measured, and the old figure was contention.
   Warm, at a one-minute load average of 9-10, three consecutive runs came in at
-  **4.0 s, 5.7 s and 21.2 s** — the third while the load spiked past 14 — so
+  **4.0 s, 5.7 s and 21.2 s**, the third while the load spiked past 14, so
   about 5 s is the honest warm number and anything above that is other jobs. In
   process the demo reports **0.5 s** of scoring and searching plus **4.9 s** to
   import torch and load the checkpoints. The one real cost remains the first run
@@ -295,8 +295,8 @@ corners from 415 matches across 8 competitions, out of 476 matches walked.
   | `OMP_NUM_THREADS=10` | 0.38 s | 0.45 s |
 
   So the pin is worth roughly 0.2 s at the default, not 2 s, and the 2.5-2.9 s
-  regime did not reproduce at any thread count I could set. The pin stays — it is
-  free, it provably takes effect, and it keeps the app off the other cores — but
+  regime did not reproduce at any thread count I could set. The pin stays, it is
+  free, it provably takes effect, and it keeps the app off the other cores, but
   the under-one-second round trip was never as close to breaking as this file
   claimed.
 - ~~The test suite is slower to start than it is to run, and the old per-file
@@ -346,8 +346,8 @@ corners from 415 matches across 8 competitions, out of 476 matches walked.
   error.
 - The `network` marker declared in `pyproject.toml` has no user and should not
   acquire one. Every test that goes near the fetch path deliberately *blocks* the
-  network — `tests/test_cli.py::no_network` replaces `_io.fetch_json`,
-  `socket.socket` and `socket.create_connection` with things that raise — so a
+  network, `tests/test_cli.py::no_network` replaces `_io.fetch_json`,
+  `socket.socket` and `socket.create_connection` with things that raise, so a
   test that genuinely needed the network would be a bug rather than a marker
   case. The marker should be dropped, but `pyproject.toml` is frozen.
 - **The scripts under `analysis/` are outside the package and outside the test
@@ -359,7 +359,7 @@ corners from 415 matches across 8 competitions, out of 476 matches walked.
   document should not depend on an untested file.
 - `data/` and `runs/` are gitignored, so a fresh clone can score corners with
   the bundled checkpoints but cannot reproduce the metrics without a full
-  `setpiece fetch` — several hundred matches at one request per second, about an
+  `setpiece fetch`, several hundred matches at one request per second, about an
   hour of mostly waiting. There is no smaller published dataset artefact.
 - `docs/search-objective.md` still says "`README.md` should carry that caveat
   next to the `suggest` example. It does not today." It does now, under "What a

@@ -833,7 +833,7 @@ def test_pretty_output_states_the_search_width() -> None:
 # properties of the search itself rather than of any checkpoint, so they are
 # asserted here against the stand-in scorers: the null it is measured against
 # must be legal, and the search must beat that null under its own objective. The
-# third piece — that a delta is relative to the objective that produced it — is
+# third piece, that a delta is relative to the objective that produced it, is
 # the caveat the document exists to record, and it is asserted directly.
 # --------------------------------------------------------------------------- #
 class RivalShotModel:

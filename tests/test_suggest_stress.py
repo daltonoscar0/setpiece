@@ -356,7 +356,7 @@ def wide_budget(
 
 
 #: (movers, max_move, min_sep, beam, seed, deep_candidates) for the widened
-#: sweep. ``max_candidates`` is always ``None`` here — every defender on the
+#: sweep. ``max_candidates`` is always ``None`` here, every defender on the
 #: frame is a candidate for the first move, which is the setting the default of
 #: six exists to avoid paying for.
 WIDE_SETTINGS = (
